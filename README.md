@@ -21,7 +21,7 @@ pip install -r requirements.txt
 ## Project Structure
 ```plaintext
 📂 Macro-SP500-Forecast
-│── 📂 data                    # Raw and processed datasets
+│── 📂 data                    # Raw datasets (S&P Daily Close Price and Macro-Financial Features)
 │── 📂 src                     # Source code
 │   │── processor.py           # Preprocessing module
 │   │── EDA.ipynb              # Exploratory Data Analysis
