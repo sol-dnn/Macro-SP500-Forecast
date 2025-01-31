@@ -1,7 +1,7 @@
 # S&P 500 Forecasting Using Macro-Financial Variables
 
 ## Overview
-This project leverages **machine learning** techniques to forecast the **weekly log returns** of the **S&P 500** using a dataset of macro-financial variables spanning over 20 years as part of **AI for Alpha**'s chalenge. The project was implemented using an **Object-Oriented Programming (OOP)** approach for better modularity and maintainability.
+This project leverages **machine learning** techniques to forecast the **weekly log returns** of the **S&P 500** using a dataset of macro-financial variables spanning over 20 years as part of **AI for Alpha**'s data challenge. The project was implemented using an **Object-Oriented Programming (OOP)** approach for better modularity and maintainability.
 
 ## Features
 - **Exploratory Data Analysis:** ..
