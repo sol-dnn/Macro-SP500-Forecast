@@ -1,41 +1,139 @@
-from src.pipeline import ModelPipeline
+from sklearn.base import TransformerMixin, BaseEstimator
 import pandas as pd
+from typing import List
 
-# 1) Load your saved pipeline
-mp = ModelPipeline.load_model("artifacts/model.joblib")
+class CrossSectionalPreprocessor(BaseEstimator, TransformerMixin):
+    """
+    Transformer for cross-sectional winsorization and imputation of features.
 
-# 2) Load or construct the DataFrame that has all transformations applied:
-#    For example, if you precomputed transformations offline:
-df_scoring = pd.read_parquet("data/processed/scoring_dataset.parquet")
+    Steps:
+      1. Replace inf/-inf with NaN
+      2. Winsorize numeric features per date
+      3. Impute numeric by median per (date, sector)
+      4. Impute numeric by median per date
+      5. Impute categoricals by mode per date
+      6. Fill remaining missing with a sentinel value
 
-# 3) Define your CV configuration exactly as in training
-cv_conf = {
-    "n_splits": 5,
-    "embargo": 2,
-    "purge": True,
-    # …etc, matching your PurgedWalkForwardCV signature…
-}
+    Parameters:
+        features: list of feature column names
+        sector_col: sector grouping column name (default 'GICS_sector_name')
+        cat_features: list of categorical feature names (default empty)
+        lower_q, upper_q: quantile bounds for winsorization
+        fill_value: value to impute remaining missing (default -11)
+        verbose: if True, prints missing value report
+    """
+    def __init__(
+        self,
+        features: List[str],
+        sector_col: str = 'GICS_sector_name',
+        cat_features: List[str] = None,
+        lower_q: float = 0.03,
+        upper_q: float = 0.97,
+        fill_value: float = -11,
+        verbose: bool = False
+    ):
+        self.features = features
+        self.sector_col = sector_col
+        self.cat_features = cat_features or []
+        self.lower_q = lower_q
+        self.upper_q = upper_q
+        self.fill_value = fill_value
+        self.verbose = verbose
 
-# 4) Call apply_model on that DataFrame
-results = mp.apply_model(
-    df_model=df_scoring,
-    cv_conf=cv_conf,
-    target="y",                # your target column name
-    features=[                  # list exactly the feature columns the pipeline uses
-        "feat1", "feat2", "feat3", …
-    ],
-    split_stage="S1",           # or "S2" if you want that stage
-    get_feature_analysis=False  # turn on if you also want importances/PCA
-)
+    def fit(self, X: pd.DataFrame, y=None):
+        # No learning step
+        return self
 
-# 5) Inspect the outputs
-df_preds     = results["val_preds"]
-ml_score     = results["ml_superiority_mean"]
-mae_score    = results["mae_mean"]
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        df = X.copy()
+        # 0) initial missing summary
+        missing0 = df[self.features].isna().sum()
 
-print("OOS predictions shape:", df_preds.shape)
-print("ML superiority:", ml_score)
-print("MAE:", mae_score)
+        # 0.b) replace infinite values
+        df = df.replace([float('inf'), float('-inf')], pd.NA)
+        missing_inf = df[self.features].isna().sum()
+
+        # 1) winsorization per date
+        for col in self.features:
+            if col not in self.cat_features:
+              if not col.startswith("ic_estimate_eps_num"):
+                df[col] = df.groupby(level='date')[col].transform(
+                    self._winsorize_group
+                )
+        missing1 = df[self.features].isna().sum()
+
+        # 2) sector-level median imputation
+        medians = (
+            df.reset_index()
+              .groupby(['date', self.sector_col])[self.features]
+              .median()
+        )
+        df = df.apply(
+            self._impute_sector(medians),
+            axis=1
+        )
+        missing2 = df[self.features].isna().sum()
+
+        # 3) date-level median imputation
+        for col in self.features:
+            if col not in self.cat_features:
+                df[col] = df.groupby(level='date')[col].transform(
+                    lambda grp: grp.fillna(grp.median())
+                )
+        missing3 = df[self.features].isna().sum()
+
+        # 4) categorical mode imputation per date
+        for col in self.cat_features:
+            df[col] = df.groupby(level='date')[col].transform(
+                self._fill_mode
+            )
+        missing4 = df[self.features].isna().sum()
+
+        # 5) final fill
+        df[self.features] = df[self.features].fillna(self.fill_value)
+        missing5 = df[self.features].isna().sum()
+
+        if self.verbose:
+            report = pd.DataFrame({
+                'before': missing0,
+                'after_inf': missing_inf,
+                'after_winsor': missing1,
+                'after_sector': missing2,
+                'after_date_median': missing3,
+                'after_cat': missing4,
+                'after_fill': missing5
+            })
+            print("Preprocessing missing value report:")
+            print(report)
+
+        return df
+
+    def _winsorize_group(self, s: pd.Series) -> pd.Series:
+        lower = s.quantile(self.lower_q)
+        upper = s.quantile(self.upper_q)
+        return s.clip(lower=lower, upper=upper)
+
+    def _impute_sector(self, medians: pd.DataFrame):
+        def imputer(row):
+            values = row[self.features]
+            if values.isna().any():
+                date, sector = row.name[0], row[self.sector_col]
+                try:
+                    return medians.loc[(date, sector)]
+                except KeyError:
+                    return values
+            return values
+        return imputer
+
+    def _fill_mode(self, grp: pd.Series) -> pd.Series:
+        if grp.isna().all():
+            return grp
+        mode_vals = grp.mode()
+        if len(mode_vals) == 0:
+            return grp
+        return grp.fillna(mode_vals.iloc[0])
+
+
 
 
 # S&P 500 Forecasting Using Macro-Financial Variables
