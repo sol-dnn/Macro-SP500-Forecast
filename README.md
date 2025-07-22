@@ -12,10 +12,9 @@ class CrossSectionalPreprocessor(BaseEstimator, TransformerMixin):
       0. Detect and transform skewed features (signed square root if |skew| > threshold)
       1. Replace inf/-inf with NaN
       2. Winsorize numeric features per date
-      3. Impute numeric by median per (date, sector)
-      4. Impute numeric by median per date
-      5. Impute categorical by mode per date
-      6. Fill remaining missing with a sentinel value
+      3. Impute numeric by median per (date, sector) and then per date
+      4. Impute categorical by mode per date
+      5. Fill remaining missing with sentinel value
 
     Parameters:
         features: list of feature column names to process
@@ -44,12 +43,11 @@ class CrossSectionalPreprocessor(BaseEstimator, TransformerMixin):
         self.verbose = verbose
 
     def fit(self, X: pd.DataFrame, y=None):
-        # No fitting necessary for this transformer
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         df = X.copy()
-        # Determine numeric and categorical based on dtype
+        # Identify numeric and categorical features from provided list
         num_cols = [c for c in self.features if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
         cat_cols = [c for c in self.features if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]
 
@@ -68,42 +66,35 @@ class CrossSectionalPreprocessor(BaseEstimator, TransformerMixin):
         df[num_cols] = df.groupby(level='date')[num_cols].transform(self._winsorize_group)
         missing1 = df[self.features].isna().sum()
 
-        # 3) Sector-level median imputation for numeric features
-        med = df.reset_index().groupby(['date', self.sector_col])[num_cols].median()
-        def sector_imputer(row):
-            date, sector = row.name[0], row[self.sector_col]
-            for col in num_cols:
-                if pd.isna(row[col]):
-                    try:
-                        row[col] = med.loc[(date, sector), col]
-                    except KeyError:
-                        pass
-            return row
-        df = df.apply(sector_imputer, axis=1)
+        # 3a) Sector-level median imputation for numeric features
+        try:
+            df[num_cols] = df.groupby([pd.Grouper(level='date'), self.sector_col])[num_cols] \
+                            .transform(lambda grp: grp.fillna(grp.median()))
+        except KeyError:
+            # If sector_col not present in index, skip sector-level imputation
+            pass
+        # 3b) Date-level median imputation for numeric features
+        df[num_cols] = df.groupby(level='date')[num_cols] \
+                        .transform(lambda grp: grp.fillna(grp.median()))
         missing2 = df[self.features].isna().sum()
 
-        # 4) Date-level median imputation for numeric features
-        df[num_cols] = df.groupby(level='date')[num_cols].transform(lambda grp: grp.fillna(grp.median()))
-        missing3 = df[self.features].isna().sum()
-
-        # 5) Categorical mode imputation per date
+        # 4) Categorical mode imputation per date
         for col in cat_cols:
             df[col] = df.groupby(level='date')[col].transform(self._fill_mode)
-        missing4 = df[self.features].isna().sum()
+        missing3 = df[self.features].isna().sum()
 
-        # 6) Final fill for any remaining missing values
+        # 5) Final fill for any remaining missing values
         df[self.features] = df[self.features].fillna(self.fill_value)
-        missing5 = df[self.features].isna().sum()
+        missing4 = df[self.features].isna().sum()
 
         if self.verbose:
             report = pd.DataFrame({
                 'before': missing0,
                 'after_inf': missing_inf,
                 'after_winsor': missing1,
-                'after_sector': missing2,
-                'after_date_median': missing3,
-                'after_cat': missing4,
-                'after_fill': missing5
+                'after_sector_date': missing2,
+                'after_cat': missing3,
+                'after_fill': missing4
             })
             print("Missing value report:")
             print(report)
@@ -123,7 +114,6 @@ class CrossSectionalPreprocessor(BaseEstimator, TransformerMixin):
         if not mode_vals.empty:
             return grp.fillna(mode_vals.iloc[0])
         return grp
-
 
 # S&P 500 Forecasting Using Macro-Financial Variables
 
