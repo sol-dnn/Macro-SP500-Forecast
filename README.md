@@ -1,95 +1,97 @@
-from sklearn.base import TransformerMixin, BaseEstimator
 import pandas as pd
+import numpy as np
+from scipy.stats import skew
+from sklearn.base import TransformerMixin, BaseEstimator
 from typing import List
 
 class CrossSectionalPreprocessor(BaseEstimator, TransformerMixin):
     """
-    Transformer for cross-sectional winsorization and imputation of features.
+    Transformer for cross-sectional winsorization, skew correction, and imputation of features.
 
     Steps:
+      0. Detect and transform skewed features (signed square root if |skew| > threshold)
       1. Replace inf/-inf with NaN
       2. Winsorize numeric features per date
       3. Impute numeric by median per (date, sector)
       4. Impute numeric by median per date
-      5. Impute categoricals by mode per date
+      5. Impute categorical by mode per date
       6. Fill remaining missing with a sentinel value
 
     Parameters:
-        features: list of feature column names
-        sector_col: sector grouping column name (default 'GICS_sector_name')
-        cat_features: list of categorical feature names (default empty)
+        features: list of feature column names to process
+        sector_col: sector grouping column name
         lower_q, upper_q: quantile bounds for winsorization
-        fill_value: value to impute remaining missing (default -11)
+        skew_threshold: threshold for skew detection
+        fill_value: value to impute remaining missing
         verbose: if True, prints missing value report
     """
     def __init__(
         self,
         features: List[str],
         sector_col: str = 'GICS_sector_name',
-        cat_features: List[str] = None,
         lower_q: float = 0.03,
         upper_q: float = 0.97,
+        skew_threshold: float = 1.0,
         fill_value: float = -11,
         verbose: bool = False
     ):
         self.features = features
         self.sector_col = sector_col
-        self.cat_features = cat_features or []
         self.lower_q = lower_q
         self.upper_q = upper_q
+        self.skew_threshold = skew_threshold
         self.fill_value = fill_value
         self.verbose = verbose
 
     def fit(self, X: pd.DataFrame, y=None):
-        # No learning step
+        # No fitting necessary for this transformer
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         df = X.copy()
-        # 0) initial missing summary
+        # Determine numeric and categorical based on dtype
+        num_cols = [c for c in self.features if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+        cat_cols = [c for c in self.features if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]
+
+        # 0) Skew correction for numeric features
+        skew_vals = {col: skew(df[col].dropna()) for col in num_cols}
+        for col, val in skew_vals.items():
+            if abs(val) > self.skew_threshold:
+                df[col] = self._signed_sqrt(df[col])
         missing0 = df[self.features].isna().sum()
 
-        # 0.b) replace infinite values
-        df = df.replace([float('inf'), float('-inf')], pd.NA)
+        # 1) Replace infinite values
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
         missing_inf = df[self.features].isna().sum()
 
-        # 1) winsorization per date
-        for col in self.features:
-            if col not in self.cat_features:
-              if not col.startswith("ic_estimate_eps_num"):
-                df[col] = df.groupby(level='date')[col].transform(
-                    self._winsorize_group
-                )
+        # 2) Winsorize numeric features per date
+        df[num_cols] = df.groupby(level='date')[num_cols].transform(self._winsorize_group)
         missing1 = df[self.features].isna().sum()
 
-        # 2) sector-level median imputation
-        medians = (
-            df.reset_index()
-              .groupby(['date', self.sector_col])[self.features]
-              .median()
-        )
-        df = df.apply(
-            self._impute_sector(medians),
-            axis=1
-        )
+        # 3) Sector-level median imputation for numeric features
+        med = df.reset_index().groupby(['date', self.sector_col])[num_cols].median()
+        def sector_imputer(row):
+            date, sector = row.name[0], row[self.sector_col]
+            for col in num_cols:
+                if pd.isna(row[col]):
+                    try:
+                        row[col] = med.loc[(date, sector), col]
+                    except KeyError:
+                        pass
+            return row
+        df = df.apply(sector_imputer, axis=1)
         missing2 = df[self.features].isna().sum()
 
-        # 3) date-level median imputation
-        for col in self.features:
-            if col not in self.cat_features:
-                df[col] = df.groupby(level='date')[col].transform(
-                    lambda grp: grp.fillna(grp.median())
-                )
+        # 4) Date-level median imputation for numeric features
+        df[num_cols] = df.groupby(level='date')[num_cols].transform(lambda grp: grp.fillna(grp.median()))
         missing3 = df[self.features].isna().sum()
 
-        # 4) categorical mode imputation per date
-        for col in self.cat_features:
-            df[col] = df.groupby(level='date')[col].transform(
-                self._fill_mode
-            )
+        # 5) Categorical mode imputation per date
+        for col in cat_cols:
+            df[col] = df.groupby(level='date')[col].transform(self._fill_mode)
         missing4 = df[self.features].isna().sum()
 
-        # 5) final fill
+        # 6) Final fill for any remaining missing values
         df[self.features] = df[self.features].fillna(self.fill_value)
         missing5 = df[self.features].isna().sum()
 
@@ -103,37 +105,24 @@ class CrossSectionalPreprocessor(BaseEstimator, TransformerMixin):
                 'after_cat': missing4,
                 'after_fill': missing5
             })
-            print("Preprocessing missing value report:")
+            print("Missing value report:")
             print(report)
 
         return df
+
+    def _signed_sqrt(self, series: pd.Series) -> pd.Series:
+        return np.sign(series) * np.sqrt(series.abs())
 
     def _winsorize_group(self, s: pd.Series) -> pd.Series:
         lower = s.quantile(self.lower_q)
         upper = s.quantile(self.upper_q)
         return s.clip(lower=lower, upper=upper)
 
-    def _impute_sector(self, medians: pd.DataFrame):
-        def imputer(row):
-            values = row[self.features]
-            if values.isna().any():
-                date, sector = row.name[0], row[self.sector_col]
-                try:
-                    return medians.loc[(date, sector)]
-                except KeyError:
-                    return values
-            return values
-        return imputer
-
     def _fill_mode(self, grp: pd.Series) -> pd.Series:
-        if grp.isna().all():
-            return grp
         mode_vals = grp.mode()
-        if len(mode_vals) == 0:
-            return grp
-        return grp.fillna(mode_vals.iloc[0])
-
-
+        if not mode_vals.empty:
+            return grp.fillna(mode_vals.iloc[0])
+        return grp
 
 
 # S&P 500 Forecasting Using Macro-Financial Variables
