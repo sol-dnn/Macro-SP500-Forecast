@@ -1,32 +1,20 @@
-# In apply_grid_search, before any work starts:
-print("[GRID SEARCH] ▶️ Starting full grid search")
+def save_model(self, filename: str = None):
+    if self.pipeline is None:
+        raise ValueError("No pipeline loaded to save.")
 
-# Right before feature engineering:
-print("[GRID SEARCH] 🔧 Feature engineering on raw data…")
+    os.makedirs(self.DEFAULT_MODEL_DIR, exist_ok=True)
 
-# Right before cross‑sectional preprocessing:
-print("[GRID SEARCH] 🧹 Cross‑sectional preprocessing of features…")
+    if filename is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"model_{timestamp}.joblib"
+    
+    path = os.path.join(self.DEFAULT_MODEL_DIR, filename)
 
-# At the top of the model loop:
-print(f"[GRID SEARCH] 🤖 Tuning model '{model_name}'")
+    # ✅ Ajout critique : création du dossier parent du path final
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-# At the start of each CV config:
-print(f"[GRID SEARCH]   CV config: {cv_conf}")
-
-# Inside run_inner_cv, at the top:
-print("[INNER CV] ▶️  Running inner train/val splits")
-
-# After retrieving splits:
-print(f"[INNER CV]   {len(splits_inner)} splits found")
-
-# At each split:
-print(f"[INNER CV]   ▶️  Split {split_id}/{len(splits_inner)}")
-
-# Before fitting each hyper‑parameter combo:
-print(f"[INNER CV]     🔎  Params: {params}")
-
-# After grid search completes:
-print("[GRID SEARCH] ✅ Grid search finished; saving best pipeline")
+    joblib.dump(self.pipeline, path)
+    print(f"✅ Saved best pipeline to {path}")
 
 
 # S&P 500 Forecasting Using Macro-Financial Variables
