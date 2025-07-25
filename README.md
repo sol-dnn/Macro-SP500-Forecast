@@ -1,32 +1,12 @@
-
-    
-        """
-    Executes full grid search over (model × CV config).
-
-    Workflow:
-      1) Create features on raw DataFrame
-      2) Apply cross-sectional preprocessing on full feature set
-      3) For each model & CV config:
-         a) build pipeline: ColumnSelector ➔ RobustScaler ➔ Regressor
-         b) run inner CV & collect metrics
-      4) Save best pipeline with timestamp
-    """
-    # 1) feature engineering on full raw set
-    df_feat = FeatureCreator(helpers=feature_helpers).fit_transform(df_raw)
-    # 2) cross-sectional prep on full features
-    df_model = cs_preprocessor.fit_transform(df_feat)
-
-
-
-# save with timestamp
-    from datetime import datetime
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f"best_pipeline_{ts}.joblib"
-    path = os.path.join(output_dir, filename)
-    joblib.dump(best_pipe, path)
-    print(f"Saved best pipeline to {path}")
-
-    return summary.sort_values('mean_mae_val').reset_index(drop=True)
+cs_kwargs = {
+    "features":        features,
+    "sector_col":      "GICS_sector_name",
+    "lower_q":         0.03,
+    "upper_q":         0.97,
+    "skew_threshold":  1.0,
+    "fill_value":      -11,
+    "verbose":         True
+}
 
 
 # S&P 500 Forecasting Using Macro-Financial Variables
