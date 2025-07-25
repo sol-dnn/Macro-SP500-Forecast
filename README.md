@@ -1,8 +1,33 @@
-    # Persist best pipeline using ModelPipeline.save_model (auto‑timestamped)
-        from src.pipeline import ModelPipeline
-        mp2 = ModelPipeline(pipeline=best_pipe)
-        saved_path = mp2.save_model()
-        print(f"Saved best pipeline to {saved_path}")
+# In apply_grid_search, before any work starts:
+print("[GRID SEARCH] ▶️ Starting full grid search")
+
+# Right before feature engineering:
+print("[GRID SEARCH] 🔧 Feature engineering on raw data…")
+
+# Right before cross‑sectional preprocessing:
+print("[GRID SEARCH] 🧹 Cross‑sectional preprocessing of features…")
+
+# At the top of the model loop:
+print(f"[GRID SEARCH] 🤖 Tuning model '{model_name}'")
+
+# At the start of each CV config:
+print(f"[GRID SEARCH]   CV config: {cv_conf}")
+
+# Inside run_inner_cv, at the top:
+print("[INNER CV] ▶️  Running inner train/val splits")
+
+# After retrieving splits:
+print(f"[INNER CV]   {len(splits_inner)} splits found")
+
+# At each split:
+print(f"[INNER CV]   ▶️  Split {split_id}/{len(splits_inner)}")
+
+# Before fitting each hyper‑parameter combo:
+print(f"[INNER CV]     🔎  Params: {params}")
+
+# After grid search completes:
+print("[GRID SEARCH] ✅ Grid search finished; saving best pipeline")
+
 
 # S&P 500 Forecasting Using Macro-Financial Variables
 
