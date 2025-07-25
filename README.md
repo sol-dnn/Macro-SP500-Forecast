@@ -1,5 +1,8 @@
-    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    DEFAULT_MODEL_DIR = os.path.join(PROJECT_ROOT, "artifacts")
+    # Persist best pipeline using ModelPipeline.save_model (auto‑timestamped)
+        from src.pipeline import ModelPipeline
+        mp2 = ModelPipeline(pipeline=best_pipe)
+        saved_path = mp2.save_model()
+        print(f"Saved best pipeline to {saved_path}")
 
 # S&P 500 Forecasting Using Macro-Financial Variables
 
