@@ -1,76 +1,170 @@
 import pandas as pd
-from sklearn.base import TransformerMixin, BaseEstimator
+import numpy as np
+from itertools import product
+from copy import deepcopy
+from sklearn.base import clone
+from sklearn.pipeline import Pipeline
+from src.cv import PurgedWalkForwardCV
+from src.features import FeatureCreator, ColumnSelector, CrossSectionalPreprocessor
+from src.utils import compute_mae, compute_ml_superiority, compute_stats
 
-class FeatureCreator(BaseEstimator, TransformerMixin):
+
+def run_inner_cv(
+    df_model: pd.DataFrame,
+    cv_conf: dict,
+    features: list,
+    target: str,
+    model_pipeline: Pipeline,
+    param_grid: dict
+) -> (pd.DataFrame, dict):
     """
-    Builds model features end-to-end by running several transformation steps.
+    Perform inner train/validation CV loop for one model and CV config.
 
-    Steps executed in order:
-      1. _scale_by_price
-      2. _transform_date
-      3. _add_idiosyncratic_metrics
-      4. _add_fundamental_ratios
-      5. _add_lagged_features
-
-    No external helpers are required.
+    Returns a DataFrame of per-split metrics and a dict of trained pipelines.
     """
-    def __init__(self):
-        pass
+    # collect per-parameter results
+    results_all = defaultdict(list)
+    val_preds_by_param = defaultdict(list)
+    pipe_dict = {}
 
-    def fit(self, X: pd.DataFrame, y=None):
-        # Stateless transformer
-        return self
+    # get inner splits for tuning
+    cv = PurgedWalkForwardCV(**cv_conf)
+    splits_inner = cv.get_inner_splits()
 
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        df = X.copy()
-        df = self._scale_by_price(df)
-        df = self._transform_date(df)
-        df = self._add_idiosyncratic_metrics(df)
-        df = self._add_fundamental_ratios(df)
-        df = self._add_lagged_features(df)
-        return df
+    for split_id, inner in enumerate(splits_inner, start=1):
+        train_dates = inner['train_inner']
+        val_dates   = inner['val_inner']
 
-    def _scale_by_price(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Example: scale raw_var by price
-        if 'raw_var' in df.columns and 'price' in df.columns:
-            df['scaled_var'] = df['raw_var'] / df['price']
-        return df
+        df_train = df_model.loc[df_model.index.get_level_values('date').isin(train_dates)]
+        df_val   = df_model.loc[df_model.index.get_level_values('date').isin(val_dates)]
 
-    def _transform_date(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Extract date-based features from a DateTimeIndex level 'date'
-        if isinstance(df.index, pd.MultiIndex) and 'date' in df.index.names:
-            df['month'] = df.index.get_level_values('date').month
-            df['weekday'] = df.index.get_level_values('date').weekday
-        return df
+        X_train, y_train = df_train[features], df_train[target]
+        X_val,   y_val   = df_val[features],   df_val[target]
 
-    def _add_idiosyncratic_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Placeholder: compute idiosyncratic volatility/residuals
-        # e.g., df['idio_vol'] = ...
-        return df
+        # loop over all hyperparameter combinations
+        for combo in product(*param_grid.values()):
+            params = dict(zip(param_grid.keys(), combo))
+            # clone and set hyperparameters
+            pipe = clone(model_pipeline)
+            pipe.set_params(**{f"regressor__{k}": v for k, v in params.items()})
+            # fit & predict
+            pipe.fit(X_train, y_train)
+            y_pred_tr = pipe.predict(X_train)
+            y_pred_val= pipe.predict(X_val)
 
-    def _add_fundamental_ratios(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Placeholder: compute P/E, P/B, ROA, etc.
-        # e.g., df['pe_ratio'] = df['price'] / df['eps']
-        return df
+            # save out-of-sample predictions
+            df_val_copy = df_val.copy()
+            df_val_copy['y_true'] = y_val
+            df_val_copy['y_pred'] = y_pred_val
+            key = tuple(sorted(params.items()))
+            val_preds_by_param[key].append(df_val_copy)
 
-    def _add_lagged_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Placeholder: compute lagged/growth features
-        # e.g., df['sales_growth_1y'] = df['sales'].pct_change(252)
-        return df
+            # compute metrics
+            mae_tr = compute_mae(y_train, y_pred_tr)
+            mae_va = compute_mae(y_val,   y_pred_val)
+            _, ml_sup = compute_ml_superiority(df_val_copy, pred_col='y_pred')
 
-class ColumnSelector(BaseEstimator, TransformerMixin):
+            # record
+            results_all[key].append({
+                'split_id': split_id,
+                'params': params,
+                'mae_train': mae_tr,
+                'mae_val': mae_va,
+                'ml_superiority': ml_sup
+            })
+            # keep a copy of the fitted pipeline
+            pipe_dict[key] = deepcopy(pipe)
+
+    # summarize across splits
+    summary = []
+    for key, metrics in results_all.items():
+        # extract lists
+        mae_tr_list = [m['mae_train'] for m in metrics]
+        mae_va_list = [m['mae_val']   for m in metrics]
+        ml_list     = [m['ml_superiority'] for m in metrics]
+        # compute stats
+        mean_tr, std_tr, ci_low_tr, ci_high_tr = compute_stats(mae_tr_list)
+        mean_va, std_va, ci_low_va, ci_high_va = compute_stats(mae_va_list)
+        mean_ml, std_ml, ci_low_ml, ci_high_ml = compute_stats(ml_list)
+        summary.append({
+            'params': dict(key),
+            'mean_mae_train': mean_tr,
+            'std_mae_train': std_tr,
+            'ci_low_mae_train': ci_low_tr,
+            'ci_high_mae_train': ci_high_tr,
+            'mean_mae_val': mean_va,
+            'std_mae_val': std_va,
+            'ci_low_mae_val': ci_low_va,
+            'ci_high_mae_val': ci_high_va,
+            'mean_ml_superiority': mean_ml,
+            'std_ml_superiority': std_ml,
+            'ci_low_ml_superiority': ci_low_ml,
+            'ci_high_ml_superiority': ci_high_ml
+        })
+
+    results_df = pd.DataFrame(sorted(summary, key=lambda x: x['mean_mae_val']))
+    return results_df, pipe_dict
+
+
+def apply_grid_search(
+    df_model: pd.DataFrame,
+    model_grid: dict,
+    cv_grid: list,
+    feature_helpers: list,
+    features: list,
+    target: str,
+    sector_col: str,
+    skew_threshold: float,
+    winsor_q: tuple,
+    save_path: str
+) -> pd.DataFrame:
     """
-    Selects a specified subset of columns from a DataFrame.
+    Execute full grid search over (model × CV config) using run_inner_cv.
+    Builds each full pipeline from raw data, aggregates results, saves best pipeline.
     """
-    def __init__(self, columns: list):
-        self.columns = columns
+    all_results = []
+    all_pipes = {}
 
-    def fit(self, X: pd.DataFrame, y=None):
-        return self
+    for model_name, info in model_grid.items():
+        ModelClass = info['model']
+        param_grid = info['param_grid']
 
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        return X[self.columns].copy()
-   
+        for cv_conf in cv_grid:
+            # 1) build full pipeline
+            pipe = Pipeline([
+                ('feat',   FeatureCreator(helpers=feature_helpers)),
+                ('prep1',  ColumnSelector(columns=features + [sector_col])),
+                ('prep2',  CrossSectionalPreprocessor(
+                              features=features,
+                              sector_col=sector_col,
+                              lower_q=winsor_q[0],
+                              upper_q=winsor_q[1],
+                              skew_threshold=skew_threshold
+                          )),
+                ('select',ColumnSelector(columns=features)),
+                ('regressor', ModelClass())
+            ])
+            # 2) run inner CV tuning
+            res_df, pipes = run_inner_cv(
+                df_model, cv_conf, features, target, pipe, param_grid
+            )
+            res_df['model'] = model_name
+            res_df['cv_conf'] = str(cv_conf)
+            all_results.append(res_df)
+            all_pipes.update(pipes)
+
+    # concat all results
+    final_df = pd.concat(all_results, ignore_index=True)
+    # pick best
+    best_idx = final_df['mean_mae_val'].idxmin()
+    best_params = final_df.loc[best_idx, 'params']
+    best_key = tuple(sorted(best_params.items()))
+    best_pipe = all_pipes[best_key]
+    # save
+    joblib.dump(best_pipe, save_path)
+
+    return final_df.sort_values('mean_mae_val').reset_index(drop=True)
+
 # S&P 500 Forecasting Using Macro-Financial Variables
 
 ## Overview
