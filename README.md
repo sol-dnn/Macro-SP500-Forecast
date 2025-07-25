@@ -1,4 +1,24 @@
-    # save with timestamp
+
+    
+        """
+    Executes full grid search over (model × CV config).
+
+    Workflow:
+      1) Create features on raw DataFrame
+      2) Apply cross-sectional preprocessing on full feature set
+      3) For each model & CV config:
+         a) build pipeline: ColumnSelector ➔ RobustScaler ➔ Regressor
+         b) run inner CV & collect metrics
+      4) Save best pipeline with timestamp
+    """
+    # 1) feature engineering on full raw set
+    df_feat = FeatureCreator(helpers=feature_helpers).fit_transform(df_raw)
+    # 2) cross-sectional prep on full features
+    df_model = cs_preprocessor.fit_transform(df_feat)
+
+
+
+# save with timestamp
     from datetime import datetime
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f"best_pipeline_{ts}.joblib"
