@@ -1,13 +1,5 @@
-cs_kwargs = {
-    "features":        features,
-    "sector_col":      "GICS_sector_name",
-    "lower_q":         0.03,
-    "upper_q":         0.97,
-    "skew_threshold":  1.0,
-    "fill_value":      -11,
-    "verbose":         True
-}
-
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    DEFAULT_MODEL_DIR = os.path.join(PROJECT_ROOT, "artifacts")
 
 # S&P 500 Forecasting Using Macro-Financial Variables
 
