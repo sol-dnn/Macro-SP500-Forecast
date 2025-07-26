@@ -1,20 +1,9 @@
-def save_model(self, filename: str = None):
-    if self.pipeline is None:
-        raise ValueError("No pipeline loaded to save.")
-
-    os.makedirs(self.DEFAULT_MODEL_DIR, exist_ok=True)
-
-    if filename is None:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"model_{timestamp}.joblib"
-    
-    path = os.path.join(self.DEFAULT_MODEL_DIR, filename)
-
-    # ✅ Ajout critique : création du dossier parent du path final
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    joblib.dump(self.pipeline, path)
-    print(f"✅ Saved best pipeline to {path}")
+print("[APPLY_MODEL] ▶️  Starting apply_model")
+print("[APPLY_MODEL] 🔧  Running feature engineering")
+print("[APPLY_MODEL] 🧹  Applying cross‑sectional preprocessing")
+print(f"[APPLY_MODEL] 🚦  Beginning CV stage '{split_stage}' with {len(splits)} splits")
+print(f"[APPLY_MODEL] 🔗  Aggregated {len(df_preds)} total OOS rows; now computing metrics")
+print(f"[APPLY_MODEL] ✅  Done. MAE = {mae_score:.4f}, ML‑superiority = {ml_score:.4f}")
 
 
 # S&P 500 Forecasting Using Macro-Financial Variables
