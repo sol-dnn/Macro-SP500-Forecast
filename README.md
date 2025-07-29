@@ -31,6 +31,34 @@
         return result
 
 
+
+
+# Coverage do'nt delete
+
+
+# Total benchmark constituents at each date
+benchmark_counts = df_benchmark.groupby('date')['sedolcd'].nunique()
+
+# Predicted constituents at each date (i.e., universe d'investissement)
+pred_counts = df_pred.groupby('date')['sedolcd'].nunique()
+
+# Relative coverage: % of benchmark covered by your universe
+coverage_pct = (pred_counts / benchmark_counts).fillna(0)
+
+# Afficher quelques stats
+print("Coverage moyen :", coverage_pct.mean())
+print("Coverage min / max :", coverage_pct.min(), "/", coverage_pct.max())
+
+# Visualiser
+import matplotlib.pyplot as plt
+coverage_pct.plot(title="Coverage of Benchmark by Investment Universe")
+plt.ylabel("Coverage (%)")
+plt.xlabel("Date")
+plt.show()
+
+
+
+
 # S&P 500 Forecasting Using Macro-Financial Variables
 
 ## Overview
