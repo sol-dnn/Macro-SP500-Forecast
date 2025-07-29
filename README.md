@@ -2,16 +2,26 @@ import pandas as pd
 import numpy as np
 from typing import Literal
 
-# Définition des types pour plus de clarté
+# Define types for clarity
 PortfolioType = Literal['long_only', 'short_only', 'long_short', 'q5_q1']
 WeightType = Literal['equal', 'signal']
 
 class PortfolioBuilder:
     """
-    Crée des portefeuilles cross-sectionnels basés sur une colonne signal.
-    Supporte plusieurs types de portefeuilles et méthodes de pondération.
+    Builds cross-sectional portfolios based on a signal column.
+    Returns all original columns plus 'weight' (and 'quantile' for quantile portfolios).
+    Supports multiple portfolio strategies and weighting schemes.
     """
-    def __init__(self, data: pd.DataFrame, date_col: str = 'date', asset_col: str = 'asset'):
+    def __init__(self,
+                 data: pd.DataFrame,
+                 date_col: str = 'date',
+                 asset_col: str = 'sedolcd'):
+        """
+        Parameters:
+        - data: DataFrame with at least date, asset identifier, signal, and any other columns (e.g. returns, volatility).
+        - date_col: name of the date column.
+        - asset_col: name of the asset identifier column (e.g. ticker or sedol code).
+        """
         self.data = data.copy()
         self.date_col = date_col
         self.asset_col = asset_col
@@ -21,165 +31,162 @@ class PortfolioBuilder:
                         portfolio_type: PortfolioType,
                         weight_type: WeightType) -> pd.DataFrame:
         """
-        Construit les poids de manière cross-sectionnelle par date.
-        Retourne un DataFrame avec les colonnes [date, asset, weight].
+        Build a cross-sectional portfolio by date using a single signal column.
+
+        Returns a DataFrame containing all original columns plus a new 'weight' column.
         """
-        df = self.data[[self.date_col, self.asset_col, signal_col]].dropna()
-        weights = (
+        # Drop rows where signal is missing
+        df = self.data.dropna(subset=[signal_col]).copy()
+
+        # Group by date and process each group
+        def process_group(group: pd.DataFrame) -> pd.DataFrame:
+            # 1) select assets based on portfolio type
+            if portfolio_type == 'long_only':
+                sel = group[group[signal_col] > 0].copy()
+            elif portfolio_type == 'short_only':
+                sel = group[group[signal_col] < 0].copy()
+            elif portfolio_type == 'long_short':
+                longs = group[group[signal_col] > 0]
+                shorts = group[group[signal_col] < 0]
+                sel = pd.concat([longs, shorts]).copy()
+            elif portfolio_type == 'q5_q1':
+                tmp = group.copy()
+                tmp['quantile'] = pd.qcut(tmp[signal_col], 5, labels=False) + 1
+                top = tmp[tmp['quantile'] == 5]
+                bottom = tmp[tmp['quantile'] == 1]
+                sel = pd.concat([top, bottom]).copy()
+            else:
+                raise ValueError(f"Unknown portfolio_type: {portfolio_type}")
+
+            # 2) compute weights
+            weights = self._compute_weights(sel, signal_col, weight_type, portfolio_type)
+            sel['weight'] = weights.values
+            return sel
+
+        result = (
             df.groupby(self.date_col)
-              .apply(lambda g: self._build_on_group(g, signal_col, portfolio_type, weight_type))
+              .apply(process_group)
               .reset_index(drop=True)
         )
-        return weights
+        return result
 
     def build_quantile_portfolios(self,
                                   signal_col: str,
                                   n_quantiles: int = 5,
                                   weight_type: WeightType = 'equal') -> pd.DataFrame:
         """
-        Crée des portefeuilles pour chaque quantile (1 à n_quantiles) du signal.
-        Retourne un DataFrame avec les colonnes [date, asset, quantile, weight].
+        Build portfolios for each quantile of the signal by date.
+
+        Returns a DataFrame containing all original columns plus 'quantile' and 'weight'.
         """
-        df = self.data[[self.date_col, self.asset_col, signal_col]].dropna()
-        # Attribuer le numéro de quantile par date
-        df['quantile'] = df.groupby(self.date_col)[signal_col]
-                            .transform(lambda x: pd.qcut(x, n_quantiles, labels=False) + 1)
+        df = self.data.dropna(subset=[signal_col]).copy()
+        df['quantile'] = (
+            df.groupby(self.date_col)[signal_col]
+              .transform(lambda x: pd.qcut(x, n_quantiles, labels=False) + 1)
+        )
 
-        def weight_per_quantile(group: pd.DataFrame) -> pd.DataFrame:
-            # pour chaque quantile sur la date, assigner poids
-            out = []
+        def process_quantiles(group: pd.DataFrame) -> pd.DataFrame:
+            parts = []
             for q in range(1, n_quantiles + 1):
-                subset = group[group['quantile'] == q]
-                if subset.empty:
+                sub = group[group['quantile'] == q].copy()
+                if sub.empty:
                     continue
-                # calcul poids dans le sous-groupe
-                w = self._compute_weights(subset, signal_col, weight_type)
-                df_q = subset[[self.date_col, self.asset_col]].copy()
-                df_q['quantile'] = q
-                df_q['weight'] = w.values
-                out.append(df_q)
-            return pd.concat(out) if out else pd.DataFrame(columns=[self.date_col, self.asset_col, 'quantile', 'weight'])
+                w = self._compute_weights(sub, signal_col, weight_type, 'q5_q1')
+                sub['weight'] = w.values
+                parts.append(sub)
+            return pd.concat(parts) if parts else pd.DataFrame(columns=group.columns)
 
-        weights = (
+        result = (
             df.groupby(self.date_col)
-              .apply(weight_per_quantile)
+              .apply(process_quantiles)
               .reset_index(drop=True)
         )
-        return weights
-
-    def _build_on_group(self,
-                        group: pd.DataFrame,
-                        signal_col: str,
-                        portfolio_type: PortfolioType,
-                        weight_type: WeightType) -> pd.DataFrame:
-        # Sélection en fonction du type de portefeuille
-        if portfolio_type == 'long_only':
-            sel = self._select_long(group, signal_col)
-        elif portfolio_type == 'short_only':
-            sel = self._select_short(group, signal_col)
-        elif portfolio_type == 'long_short':
-            sel = self._select_long_short(group, signal_col)
-        elif portfolio_type == 'q5_q1':
-            sel = self._select_q5_q1(group, signal_col)
-        else:
-            raise ValueError(f"Unknown portfolio_type: {portfolio_type}")
-        # Attribution des poids
-        w = self._compute_weights(sel, signal_col, weight_type, portfolio_type)
-        return sel[[self.date_col, self.asset_col]].assign(weight=w.values)
+        return result
 
     def _compute_weights(self,
-                         selection: pd.DataFrame,
+                         df_subset: pd.DataFrame,
                          signal_col: str,
                          weight_type: WeightType,
-                         portfolio_type: PortfolioType = None) -> pd.Series:
+                         portfolio_type: PortfolioType) -> pd.Series:
         """
-        Dispatch vers la méthode de pondération correspondante.
+        Delegate to the appropriate weighting method.
         """
         if weight_type == 'equal':
-            return self._equal_weights(selection, signal_col, portfolio_type)
+            return self._equal_weights(df_subset, signal_col, portfolio_type)
         elif weight_type == 'signal':
-            return self._signal_weights(selection, signal_col, portfolio_type)
+            return self._signal_weights(df_subset, signal_col, portfolio_type)
         else:
             raise ValueError(f"Unknown weight_type: {weight_type}")
 
-    def _select_long(self, group: pd.DataFrame, signal_col: str) -> pd.DataFrame:
-        return group[group[signal_col] > 0]
-
-    def _select_short(self, group: pd.DataFrame, signal_col: str) -> pd.DataFrame:
-        return group[group[signal_col] < 0]
-
-    def _select_long_short(self, group: pd.DataFrame, signal_col: str) -> pd.DataFrame:
-        return pd.concat([
-            self._select_long(group, signal_col),
-            self._select_short(group, signal_col)
-        ])
-
-    def _select_q5_q1(self, group: pd.DataFrame, signal_col: str) -> pd.DataFrame:
-        g = group.copy()
-        g['quantile'] = pd.qcut(g[signal_col], 5, labels=False) + 1
-        top = g[g['quantile'] == 5]
-        bottom = g[g['quantile'] == 1]
-        return pd.concat([top, bottom])
-
     def _equal_weights(self,
-                       selection: pd.DataFrame,
+                       df_subset: pd.DataFrame,
                        signal_col: str,
                        portfolio_type: PortfolioType) -> pd.Series:
-        n = len(selection)
+        """
+        Assign equal weights:
+        - long_only or short_only: weights sum to ±1
+        - long_short or q5_q1: each side sums to ±0.5
+        """
+        n = len(df_subset)
         if n == 0:
             return pd.Series([], dtype=float)
-        if portfolio_type in ['long_only', 'short_only']:
-            sign = 1 if portfolio_type == 'long_only' else -1
-            return pd.Series(sign / n, index=selection.index)
-        # long_short et q5_q1 utilisent logique moitié-moitié
-        longs = selection[selection[signal_col] > 0]
-        shorts = selection[selection[signal_col] < 0]
-        w = pd.Series(0, index=selection.index, dtype=float)
+        if portfolio_type == 'long_only':
+            return pd.Series(1.0/n, index=df_subset.index)
+        if portfolio_type == 'short_only':
+            return pd.Series(-1.0/n, index=df_subset.index)
+        # long_short or q5_q1: split ±0.5 per side
+        longs = df_subset[df_subset[signal_col] > 0]
+        shorts = df_subset[df_subset[signal_col] < 0]
+        w = pd.Series(0.0, index=df_subset.index)
         if not longs.empty:
-            w.loc[longs.index] = 0.5 / len(longs)
+            w.loc[longs.index] = 0.5/len(longs)
         if not shorts.empty:
-            w.loc[shorts.index] = -0.5 / len(shorts)
+            w.loc[shorts.index] = -0.5/len(shorts)
         return w
 
     def _signal_weights(self,
-                        selection: pd.DataFrame,
+                        df_subset: pd.DataFrame,
                         signal_col: str,
                         portfolio_type: PortfolioType) -> pd.Series:
-        s = selection[signal_col]
+        """
+        Assign weights proportional to signal strength:
+        - long_only: positive signals sum to 1
+        - short_only: negative signals sum to -1
+        - long_short: each side sums to ±0.5
+        - q5_q1: top quantile sum to 0.5, bottom quantile sum to -0.5
+        """
+        s = df_subset[signal_col]
         if portfolio_type == 'long_only':
             pos = s.clip(lower=0)
-            return pos.div(pos.sum()).fillna(0)
+            return pos/pos.sum() if pos.sum()>0 else pd.Series(0.0, index=df_subset.index)
         if portfolio_type == 'short_only':
             neg = s.clip(upper=0).abs()
-            return neg.div(neg.sum()).fillna(0).mul(-1)
-        # long_short
+            return -neg/neg.sum() if neg.sum()>0 else pd.Series(0.0, index=df_subset.index)
         if portfolio_type == 'long_short':
             pos = s.clip(lower=0)
             neg = s.clip(upper=0).abs()
-            w = pd.Series(0, index=selection.index, dtype=float)
-            if pos.sum() > 0:
-                w.loc[pos.index] = pos.div(pos.sum()).mul(0.5)
-            if neg.sum() > 0:
-                w.loc[neg.index] = neg.div(neg.sum()).mul(-0.5)
+            w = pd.Series(0.0, index=df_subset.index)
+            if pos.sum()>0:
+                w.loc[pos.index] = pos/pos.sum()*0.5
+            if neg.sum()>0:
+                w.loc[neg.index] = -neg/neg.sum()*0.5
             return w
-        # q5_q1
         if portfolio_type == 'q5_q1':
-            g = selection.copy()
-            g['quantile'] = pd.qcut(g[signal_col], 5, labels=False) + 1
-            top = g[g['quantile'] == 5][signal_col]
-            bot = g[g['quantile'] == 1][signal_col].abs()
-            w = pd.Series(0, index=selection.index, dtype=float)
-            if not top.empty:
-                w.loc[top.index] = top.div(top.sum()).mul(0.5)
-            if not bot.empty:
-                w.loc[bot.index] = bot.div(bot.sum()).mul(-0.5)
+            top = df_subset[df_subset['quantile']==max(df_subset['quantile'])][signal_col]
+            bot = df_subset[df_subset['quantile']==min(df_subset['quantile'])][signal_col].abs()
+            w = pd.Series(0.0, index=df_subset.index)
+            if top.sum()>0:
+                w.loc[top.index] = top/top.sum()*0.5
+            if bot.sum()>0:
+                w.loc[bot.index] = -bot/bot.sum()*0.5
             return w
-        raise ValueError(f"Unsupported portfolio_type for signal weights: {portfolio_type}")
+        raise ValueError(f"Unsupported portfolio_type: {portfolio_type}")
 
-# Exemple d'utilisation :
-# builder = PortfolioBuilder(data)
-# df_q = builder.build_quantile_portfolios(signal_col='alpha', n_quantiles=5, weight_type='signal')
-# df_longs = builder.build_portfolio('alpha', 'long_only', 'equal')
+# Example usage:
+# builder = PortfolioBuilder(df, date_col='date', asset_col='sedolcd')
+# df_weights = builder.build_portfolio('alpha', 'long_short', 'signal')
+# df_quantiles = builder.build_quantile_portfolios('alpha', n_quantiles=5, weight_type='signal')
+
 
 # S&P 500 Forecasting Using Macro-Financial Variables
 
