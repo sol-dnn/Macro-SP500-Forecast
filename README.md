@@ -16,32 +16,22 @@ from utils import (
 
 class Backtester:
     """
-    Runs portfolio strategies and computes P&L and key metrics.
+    Runs portfolio strategies and computes P&L, key metrics, and return series.
 
     Parameters:
-    - df: DataFrame with at least [date, asset, <signals...>, return_column] (e.g. close-to-close or total return)
-    - date_col: name of date column (e.g. period end, used for rebalance)
-    - asset_col: name of asset identifier (e.g. sedolcd)
-    - ret_col: name of the return column to use for PnL (e.g. 'closereturn', 'totalreturn', or 'cashreturn')
-    - cost_model: dict, supports:
+    - df: DataFrame with at least [date, asset, <signals...>, return_column]
+    - date_col: name of date column (used for grouping)
     - asset_col: name of asset identifier
-    - ret_col: name of return column (e.g. excess_return)
+    - ret_col: name of the return column (e.g. 'closereturn', 'totalreturn')
     - cost_model: dict, supports:
-        - {'type':'bps', 'bps':10}  # transaction cost in basis points per unit turnover
+        {'type':'bps', 'bps':10}  # transaction cost in basis points per unit turnover
     """
     def __init__(
         self,
         df: pd.DataFrame,
         date_col: str = 'date',
         asset_col: str = 'sedolcd',
-        ret_col: str = 'return',  # name of the return column to use (e.g. closereturn, totalreturn)
-        cost_model: Optional[Dict] = None
-    ):
-        self,
-        df: pd.DataFrame,
-        date_col: str = 'date',
-        asset_col: str = 'sedolcd',
-        ret_col: str = 'excess_return',
+        ret_col: str = 'return',
         cost_model: Optional[Dict] = None
     ):
         self.df = df.copy()
@@ -51,7 +41,10 @@ class Backtester:
         self.cost_model = cost_model or {}
 
     def _align_returns(self, df_weights: pd.DataFrame) -> pd.Series:
-        # align t->t+1 returns and compute P&L
+        """
+        Align weights at t to returns at t+1 and compute portfolio return series.
+        Returns a pd.Series indexed by date.
+        """
         df = df_weights.sort_values([self.asset_col, self.date_col]).copy()
         df['next_ret'] = df.groupby(self.asset_col)[self.ret_col].shift(-1)
         df = df.dropna(subset=['next_ret'])
@@ -59,7 +52,10 @@ class Backtester:
         return df.groupby(self.date_col)['pnl'].sum().sort_index()
 
     def _compute_turnover(self, df_weights: pd.DataFrame) -> pd.Series:
-        # turnover = 0.5 * sum(|w_t - w_{t-1}|)
+        """
+        Compute turnover=0.5*sum(|w_t - w_{t-1}|) per period.
+        Returns a pd.Series indexed by date.
+        """
         w = df_weights.pivot_table(
             index=self.date_col,
             columns=self.asset_col,
@@ -69,14 +65,21 @@ class Backtester:
         return w.diff().abs().sum(axis=1) * 0.5
 
     def _apply_transaction_costs(self, pnl: pd.Series, turnover: pd.Series) -> pd.Series:
-        # apply cost_model
+        """
+        Subtract transaction costs from the return series.
+        cost_model={'type':'bps', 'bps':10} means 10 bps per unit turnover.
+        """
         if self.cost_model.get('type') == 'bps':
             bps = self.cost_model.get('bps', 0) / 10000
             return pnl - turnover * bps
         return pnl
 
     def _compute_metrics(self, returns: pd.Series) -> Dict[str, float]:
-        # calls individual utils
+        """
+        Compute strategy metrics on a return series:
+        TotalReturn, CAGR, Sharpe, Sortino, Volatility,
+        Max Drawdown, Hit Rate, Skewness, Kurtosis.
+        """
         return {
             'TotalReturn': get_total_return(returns),
             'CAGR': get_cagr(returns),
@@ -93,35 +96,51 @@ class Backtester:
         self,
         signals: List[str],
         portfolio_type: str = 'long_only'
-    ) -> pd.DataFrame:
+    ) -> (pd.DataFrame, Dict[str, Dict[str, pd.Series]]):
         """
-        For each signal and the given portfolio_type, build weights & compute performance.
-        Returns a DataFrame report indexed by (portfolio_type, signal) with strategy metrics.
+        Run backtest for each signal and portfolio type.
+
+        Returns:
+        - report_df: DataFrame with index (portfolio_type, signal) and metric columns.
+        - series_dict: dict mapping signal -> {'gross': returns, 'gross_cum': cumreturns,
+                                               'net': returns, 'net_cum': cumreturns}
         """
         reports = []
+        series_dict = {}
+
         for sig in signals:
-            # build weights
+            # 1) build weights
             pb = PortfolioBuilder(self.df, self.date_col, self.asset_col)
             df_w = pb.build_portfolio(sig, portfolio_type, 'equal')
-            # compute gross PnL series
-            gross_pnl = self._align_returns(df_w)
-            # turnover
+            # 2) gross return series
+            gross_ret = self._align_returns(df_w)
+            gross_cum = (1 + gross_ret).cumprod()
+            # 3) turnover
             turnover = self._compute_turnover(df_w)
             avg_to = turnover.mean()
-            # net PnL after costs
-            net_pnl = self._apply_transaction_costs(gross_pnl, turnover)
-            # metrics
-            gross_metrics = self._compute_metrics(gross_pnl)
-            net_metrics = self._compute_metrics(net_pnl)
+            # 4) net return series after costs
+            net_ret = self._apply_transaction_costs(gross_ret, turnover)
+            net_cum = (1 + net_ret).cumprod()
+            # 5) compute metrics
+            g_metrics = self._compute_metrics(gross_ret)
+            n_metrics = self._compute_metrics(net_ret)
             report = {
                 'signal': sig,
                 'portfolio_type': portfolio_type,
                 'turnover': avg_to,
-                **{f'g_{k}': v for k, v in gross_metrics.items()},
-                **{f'n_{k}': v for k, v in net_metrics.items()}
+                **{f'g_{k}': v for k, v in g_metrics.items()},
+                **{f'n_{k}': v for k, v in n_metrics.items()}
             }
             reports.append(report)
-        return pd.DataFrame(reports).set_index(['portfolio_type', 'signal'])
+            series_dict[sig] = {
+                'gross': gross_ret,
+                'gross_cum': gross_cum,
+                'net': net_ret,
+                'net_cum': net_cum
+            }
+
+        report_df = pd.DataFrame(reports).set_index(['portfolio_type', 'signal'])
+        return report_df, series_dict
 
 
 # utils.py
@@ -131,22 +150,26 @@ from scipy.stats import skew, kurtosis
 
 
 def get_total_return(returns: pd.Series) -> float:
+    """Total return over the period: cumprod(1+r) - 1."""
     cum = (1 + returns).cumprod()
     return cum.iloc[-1] - 1
 
 
 def get_cagr(returns: pd.Series, periods: int = 12) -> float:
+    """Compound Annual Growth Rate from monthly returns."""
     cum = (1 + returns).cumprod()
     n = len(returns.dropna())
     return cum.iloc[-1]**(periods/n) - 1 if n > 0 else np.nan
 
 
 def get_sharpe_ratio(returns: pd.Series, periods: int = 12) -> float:
+    """Annualized Sharpe ratio (assumes zero risk-free)."""
     r = returns.dropna()
     return (r.mean()/r.std()*np.sqrt(periods)) if r.std() > 0 else np.nan
 
 
 def get_sortino_ratio(returns: pd.Series, periods: int = 12) -> float:
+    """Annualized Sortino ratio (downside vol only)."""
     r = returns.dropna()
     downside = r[r < 0]
     down_std = downside.std()*np.sqrt(periods) if len(downside) > 0 else np.nan
@@ -154,20 +177,24 @@ def get_sortino_ratio(returns: pd.Series, periods: int = 12) -> float:
 
 
 def get_max_drawdown(returns: pd.Series) -> float:
+    """Maximum peak-to-trough drawdown."""
     cum = (1 + returns).cumprod()
     peak = cum.cummax()
     return (cum/peak - 1).min()
 
 
 def get_hit_rate(returns: pd.Series) -> float:
+    """Proportion of positive return periods."""
     return (returns.dropna() > 0).mean()
 
 
 def get_skew(returns: pd.Series) -> float:
+    """Skewness of the return distribution."""
     return skew(returns.dropna())
 
 
 def get_kurtosis(returns: pd.Series) -> float:
+    """Excess kurtosis of the return distribution."""
     return kurtosis(returns.dropna())
 
 
