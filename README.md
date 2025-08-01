@@ -1,3 +1,33 @@
+import pandas as pd
+
+# 1. Créez votre liste complète de dates mensuelles
+all_dates = pd.date_range(start='2014-01-01', end='2024-12-31', freq='M')
+
+# 2. Liste unique des tickers
+all_tickers = df_clean['sedolcd'].unique()
+
+# 3. Construisez un MultiIndex complet (date, ticker)
+idx = pd.MultiIndex.from_product([all_dates, all_tickers],
+                                 names=['date','sedolcd'])
+master = pd.DataFrame(index=idx).reset_index()
+
+# 4. Merge avec vos totalreturn
+master = master.merge(df_clean[['date','sedolcd','totalreturn']],
+                      on=['date','sedolcd'],
+                      how='left')
+
+# 5. Repérez les (date, ticker) manquants
+missing = master[master['totalreturn'].isna()]
+
+# 6. Comptez ou affichez
+print("Nombre total d’observations manquantes :", len(missing))
+print("Tickers les plus concernés :")
+print(missing['sedolcd'].value_counts().head(10))
+print("Périodes manquantes les plus fréquentes :")
+print(missing['date'].value_counts().head(10))
+
+
+
 # backtester.py
 import pandas as pd
 import numpy as np
