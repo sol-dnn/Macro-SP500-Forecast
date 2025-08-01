@@ -1,3 +1,24 @@
+    def _align_returns(self, df_weights: pd.DataFrame) -> pd.Series:
+        """
+        Align weights at time t with returns from t to t+1, then compute portfolio return series.
+
+        For each rebalance date t:
+        - Uses weight_t (weights computed at t)
+        - Multiplies by asset returns over (t, t+1]
+        - Sums across assets to get portfolio return for the period (t, t+1]
+
+        Returns a pd.Series indexed by the rebalance date t. Each value is the return earned
+        over the subsequent period, i.e. weight_t * return_{t+1}.
+        """
+        df = df_weights.sort_values([self.asset_col, self.date_col]).copy()
+        # shift the returns so that next_ret at row t is the return in the following period
+        df['next_ret'] = df.groupby(self.asset_col)[self.ret_col].shift(-1)
+        df = df.dropna(subset=['next_ret'])
+        df['ret'] = df['weight'] * df['next_ret']
+        # sum across all assets for each rebalance date t
+        return df.groupby(self.date_col)['ret'].sum().sort_index()(self.date_col)['ret'].sum().sort_index()
+
+
 # backtester.py
 import pandas as pd
 import numpy as np
