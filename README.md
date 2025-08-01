@@ -74,13 +74,55 @@ class Backtester:
         return returns
 
     def _compute_universe_returns(self) -> Tuple[pd.Series, pd.Series]:
-        """
-        Compute equal-weight strategy returns for the investment universe.
-        Returns a tuple (univ_ret, univ_cum).
-        """
         univ_ret = self.df.groupby(self.date_col)[self.ret_col].mean().sort_index()
         univ_cum = (1 + univ_ret).cumprod()
         return univ_ret, univ_cum
+
+    def _compute_metrics(
+        self,
+        strat: pd.Series,
+        ref: Optional[pd.Series] = None
+    ) -> Dict[str, float]:
+        """
+        Compute full suite of metrics for strategy returns (strat) against reference (ref).
+        If ref is provided, also computes alpha, beta, TE, IR, Treynor, excess return metrics.
+
+        Always computes:
+        - TotalReturn, CAGR, Sharpe, Sortino, Vol, MaxDD, HitRate, Skew, Kurtosis
+        - Turnover if present in strat.index name 'turnover'
+
+        When ref is not None:
+        - ExcessReturn, ExcessCAGR, alpha, beta, TrackingError, InformationRatio, TreynorRatio
+        """
+        metrics = {}
+        # core strategy metrics
+        metrics.update({
+            'TotalReturn': get_total_return(strat),
+            'CAGR': get_cagr(strat),
+            'Sharpe': get_sharpe_ratio(strat),
+            'Sortino': get_sortino_ratio(strat),
+            'Vol': strat.std() * np.sqrt(12),
+            'MaxDD': get_max_drawdown(strat),
+            'HitRate': get_hit_rate(strat),
+            'Skew': get_skew(strat),
+            'Kurtosis': get_kurtosis(strat)
+        })
+        # reference and excess metrics
+        if ref is not None:
+            common = strat.index.intersection(ref.index)
+            s = strat.loc[common]
+            r = ref.loc[common]
+            excess = s - r
+            metrics.update({
+                'ExcessReturn': get_total_return(excess),
+                'ExcessCAGR': get_cagr(excess),
+                'alpha': get_alpha(s, r),
+                'beta': get_beta(s, r),
+                'TE': get_tracking_error(s, r),
+                'IR': get_information_ratio(s, r),
+                'Treynor': get_treynor_ratio(s, r)
+            })
+        return metrics
 
     def run(
         self,
@@ -90,69 +132,49 @@ class Backtester:
         reports = []
         series_dict = {}
 
-        # compute benchmark or universe series
+        # prepare reference returns
         if self.vs == 'benchmark':
             if self.benchmark_ret is None:
                 raise ValueError("benchmark_ret required when vs='benchmark'.")
             vs_ret = self.benchmark_ret.sort_index()
+            vs_cum = (1 + vs_ret).cumprod()
+            series_dict['benchmark'] = {'gross': vs_ret, 'cum': vs_cum}
         else:
-            vs_ret, vs_cum = self._compute_universe_returns()
-        if self.vs == 'universe':
-            series_dict['universe'] = {'gross': vs_ret, 'cum': vs_cum}
+            univ_ret, univ_cum = self._compute_universe_returns()
+            vs_ret, vs_cum = univ_ret, univ_cum
+            series_dict['universe'] = {'gross': univ_ret, 'cum': univ_cum}
 
         for sig in signals:
             pb = PortfolioBuilder(self.df, self.date_col, self.asset_col)
             df_w = pb.build_portfolio(sig, portfolio_type, 'equal')
+
             gross = self._align_returns(df_w)
-            gross_cum = (1 + gross).cumprod()
-            turnover = self._compute_turnover(df_w)
-            avg_to = turnover.mean()
-            net = self._apply_transaction_costs(gross, turnover)
-            net_cum = (1 + net).cumprod()
-            g_metrics = {
-                **{'turnover': avg_to},
-                **self._compute_metrics(gross)
+            net = self._apply_transaction_costs(gross, self._compute_turnover(df_w))
+
+            # store series
+            series_dict[sig] = {
+                'gross': gross,
+                'gross_cum': (1 + gross).cumprod(),
+                'net': net,
+                'net_cum': (1 + net).cumprod(),
+                'excess': (gross - vs_ret).reindex(gross.index),
+                'excess_cum': (1 + gross - vs_ret).cumprod().reindex(gross.index)
             }
-            n_metrics = self._compute_metrics(net)
 
-            # alignment for comparison
-            common_idx = gross.index.intersection(vs_ret.index)
-            strat = gross.loc[common_idx]
-            ref = vs_ret.loc[common_idx]
-            excess = strat - ref
-            excess_cum = (1 + excess).cumprod()
-
-            # factor metrics
-            alpha = get_alpha(strat, ref)
-            beta = get_beta(strat, ref)
-            te = get_tracking_error(strat, ref)
-            ir = get_information_ratio(strat, ref)
-            treynor = get_treynor_ratio(strat, ref)
+            # compute metrics for gross and net
+            g_met = self._compute_metrics(gross, vs_ret)
+            n_met = self._compute_metrics(net, vs_ret)
 
             report = {
                 'signal': sig,
                 'portfolio_type': portfolio_type,
-                **{f'g_{k}': v for k, v in g_metrics.items()},
-                **{f'n_{k}': v for k, v in n_metrics.items()},
-                'alpha': alpha,
-                'beta': beta,
-                'TE': te,
-                'IR': ir,
-                'Treynor': treynor
+                **{f'g_{k}': v for k, v in g_met.items()},
+                **{f'n_{k}': v for k, v in n_met.items()}
             }
             reports.append(report)
-            series_dict[sig] = {
-                'gross': gross,
-                'gross_cum': gross_cum,
-                'net': net,
-                'net_cum': net_cum,
-                'excess': excess,
-                'excess_cum': excess_cum
-            }
 
         report_df = pd.DataFrame(reports).set_index(['portfolio_type','signal'])
         return report_df, series_dict
-
 # utils.py
 import pandas as pd
 import numpy as np
