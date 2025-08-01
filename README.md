@@ -1,23 +1,27 @@
-    def _align_returns(self, df_weights: pd.DataFrame) -> pd.Series:
+        def _align_returns(self, df_weights: pd.DataFrame) -> pd.Series:
         """
-        Align weights at time t with returns from t to t+1, then compute portfolio return series.
+        Align returns at time t with weights from the previous rebalance (t-1), then compute portfolio return series.
 
-        For each rebalance date t:
-        - Uses weight_t (weights computed at t)
-        - Multiplies by asset returns over (t, t+1]
-        - Sums across assets to get portfolio return for the period (t, t+1]
+        For each date t (period-end):
+        - Use weight_{t-1} (weights computed at previous rebalance)
+        - Multiply by asset returns over (t-1, t]
+        - Sum across assets to get portfolio return for the period ending at t
 
-        Returns a pd.Series indexed by the rebalance date t. Each value is the return earned
-        over the subsequent period, i.e. weight_t * return_{t+1}.
+        Returns a pd.Series indexed by the date t, where each value is the return
+        earned over the previous period, i.e. weight_{t-1} * return_{t}.
+
+        Note: benchmark returns must use the same period convention: return at t is
+        the asset/index return from t-1 to t.
         """
         df = df_weights.sort_values([self.asset_col, self.date_col]).copy()
-        # shift the returns so that next_ret at row t is the return in the following period
-        df['next_ret'] = df.groupby(self.asset_col)[self.ret_col].shift(-1)
-        df = df.dropna(subset=['next_ret'])
-        df['ret'] = df['weight'] * df['next_ret']
-        # sum across all assets for each rebalance date t
-        return df.groupby(self.date_col)['ret'].sum().sort_index()(self.date_col)['ret'].sum().sort_index()
-
+        # shift weights so that prev_w at row t is the weight from the previous rebalance
+        df['prev_w'] = df.groupby(self.asset_col)['weight'].shift(1)
+        # drop first date per asset where no previous weight
+        df = df.dropna(subset=['prev_w', self.ret_col])
+        # multiply previous weight by the return over (t-1, t]
+        df['ret'] = df['prev_w'] * df[self.ret_col]
+        # sum across all assets for each period-end date t
+        return df.groupby(self.date_col)['ret'].sum().sort_index()
 
 # backtester.py
 import pandas as pd
