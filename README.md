@@ -1,28 +1,50 @@
 import pandas as pd
 
-# 1. Liste complète des tickers de l’univers
-all_tickers = master['sedolcd'].unique()
-n_tickers = len(all_tickers)
+# df_clean = master complet [date, sedolcd, totalreturn, …]
+# df_signals = [date, sedolcd, signal]
 
-# 2. Comptage des tickers présents par date
-counts = master.groupby('date')['sedolcd'].nunique()
+# 1) Repérer les dates où vous avez un signal
+signal_dates = df_signals['date'].unique()
 
-# 3. Vérifier que ce compte == nombre total de tickers
-ok = counts == n_tickers
+# 2) Repérer les tickers éligibles (au moins un signal)
+eligible_tickers = df_signals.loc[df_signals['signal'].notna(), 'sedolcd'].unique()
 
-print(f"Dates OK : {ok.sum()} / {len(ok)}")
-print(f"Dates en défaut : {(~ok).sum()}")
+# 3) Construire un index date×ticker sur cette base (dates de signal × tickers éligibles)
+idx = pd.MultiIndex.from_product(
+    [signal_dates, eligible_tickers],
+    names=['date','sedolcd']
+)
+master_sig = pd.DataFrame(index=idx).reset_index()
 
-# 4. Lister les dates où il manque des tickers
-missing_dates = counts[~ok]
-print("Dates incomplètes, avec #tickers présents :")
-print(missing_dates)
+# 4) Y merger vos returns (depuis df_clean) et vos signaux
+#    - you keep only dates ∈ signal_dates
+#    - you keep only tickers ∈ eligible_tickers
+master_sig = (
+    master_sig
+    .merge(
+        df_clean[['date','sedolcd','totalreturn']],
+        on=['date','sedolcd'],
+        how='left'
+    )
+    .merge(
+        df_signals[['date','sedolcd','signal']],
+        on=['date','sedolcd'],
+        how='left'
+    )
+)
 
-# 5. Pour chaque date manquante, voir quels tickers manquent
-for dt, cnt in missing_dates.items():
-    present = set(master.loc[master['date']==dt, 'sedolcd'])
-    missing = set(all_tickers) - present
-    print(f"\n→ {dt.date()} manque {len(missing)} tickers :", missing)
+# 5) Vérifiez qu’il n’y a plus de trous dans les returns
+missing = master_sig['totalreturn'].isna().sum()
+print(f"Totalreturn manquants sur signal dates×tickers: {missing}")
+
+# 6) Vous obtenez master_sig, votre univers d’investissement statique
+#    : uniquement les dates de signal, uniquement les tickers éligibles,
+#    avec returns et signaux (NaN quand pas de signal ce mois-là).
+
+# Ensuite, passez master_sig à PortfolioBuilder / Backtester :
+from portfolio import PortfolioBuilder
+pb = PortfolioBuilder(master_sig, date_col='date', asset_col='sedolcd')
+df_w = pb.build_portfolio('signal', 'long_only', 'equal')
 
 
 # backtester.py
