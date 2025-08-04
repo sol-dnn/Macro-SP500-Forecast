@@ -23,6 +23,37 @@
         # sum across all assets for each period-end date t
         return df.groupby(self.date_col)['ret'].sum().sort_index()
 
+
+class Backtester:
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        date_col: str = 'date',
+        asset_col: str = 'sedolcd',
+        ret_col: str = 'return',
+        vs: str = 'universe',
+        benchmark_ret: Optional[pd.Series] = None,
+        cost_model: Optional[Dict] = None,
+        currency: Optional[str] = None,          # <- new!
+        mscicol: str = 'MSCI-WRLD',              # <- name of the MSCI weight column
+        min_mscicol_weight: float = 0.0          # <- threshold
+    ):
+        # 1) copy & store parameters
+        self.df = df.copy()
+        self.date_col = date_col
+        self.asset_col = asset_col
+        self.ret_col = ret_col
+        self.vs = vs
+        self.benchmark_ret = benchmark_ret
+        self.cost_model = cost_model or {}
+
+        # 2) universe filtering by currency + MSCI weight
+        if currency is not None:
+            # keep only rows in that currency
+            self.df = self.df[self.df['instrmtccy'] == currency]
+        # keep only those tickers whose MSCI weight > min_mscicol_weight
+        self.df = self.df[self.df[mscicol] > min_mscicol_weight]
+
 # backtester.py
 import pandas as pd
 import numpy as np
