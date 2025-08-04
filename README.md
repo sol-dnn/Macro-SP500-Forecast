@@ -1,3 +1,23 @@
+# a) filter eligible assets
+eligible = self.master_df[self.master_df[self.mscicol] > 0]
+
+# b) let PortfolioBuilder build on that slice
+df_w_sub = PortfolioBuilder(
+    eligible.merge(self.df, on=[date, asset], how='left'),
+    date_col, asset_col
+).build_portfolio(sig, portfolio_type, 'equal')
+
+# c) reindex back onto master_df so everything (ret + raw weight) is in one DataFrame
+df_w = (
+    self.master_df
+      .merge(
+         df_w_sub[[date_col, asset_col, 'weight']],
+         on=[date_col, asset_col], how='left'
+      )
+      .fillna({'weight': 0.0})
+)
+
+
 # backtester.py
 import pandas as pd
 import numpy as np
