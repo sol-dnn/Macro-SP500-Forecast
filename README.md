@@ -3,47 +3,85 @@ def _erc_weights(self,
                  signal_col: str,
                  portfolio_type: str,
                  window_months: int = 36) -> pd.Series:
-    """
-    Compute asset weights using the Equal Risk Contribution (ERC) approach
-    with covariance regularization (Ledoit-Wolf) and a fixed-length rolling
-    window of historical returns.
+    current_date = df_subset[self.date_col].iloc[0]
+    w = pd.Series(0.0, index=df_subset.index)
 
-    Parameters
-    ----------
-    df_subset : pd.DataFrame
-        Subset of signal data corresponding to a single date. Must contain
-        at least the asset identifiers and signal values.
-    signal_col : str
-        Name of the signal column used to select assets.
-    portfolio_type : str
-        Type of portfolio construction:
-            - 'long_only' : only keep assets with positive signals.
-            - 'short_only' : only keep assets with negative signals.
-            - 'long_short' : combine long and short positions.
-            - 'q5_q1' : long top quantile, short bottom quantile.
-    window_months : int, default=36
-        Length of the rolling window (in months) used to estimate the covariance
-        matrix from historical returns prior to the current date.
+    # Sélection de l'historique de rendements
+    window_start = current_date - pd.DateOffset(months=window_months)
 
-    Returns
-    -------
-    pd.Series
-        Series of asset weights aligned with df_subset, using ERC approximation
-        (via inverse volatility). Weights are set to 0 for assets not selected
-        at the current date.
+    def get_returns(assets):
+        hist = self.returns_history[
+            (self.returns_history[self.date_col] < current_date) &
+            (self.returns_history[self.date_col] >= window_start) &
+            (self.returns_history[self.asset_col].isin(assets))
+        ]
+        ret = hist.pivot(index=self.date_col, columns=self.asset_col, values='Return')
+        return ret.dropna(how='any', axis=0)
 
-    Notes
-    -----
-    - Historical returns are sourced from `self.returns_history`, which must be
-      a long-term monthly return dataset with columns [date_col, asset_col, 'Return'].
-    - The function avoids lookahead bias by only using returns strictly before
-      the current date.
-    - A Ledoit-Wolf shrinkage estimator is used to improve the stability of the
-      covariance matrix, especially when the number of assets is large or the
-      historical window is short.
-    - This is an approximation of ERC via inverse volatility. If you want to
-      solve the full ERC optimization problem, use a numerical solver instead.
-    """
+    if portfolio_type == 'long_only':
+        assets = df_subset[self.asset_col].unique()
+        ret = get_returns(assets)
+        if ret.shape[0] >= 2:
+            cov = LedoitWolf().fit(ret.values).covariance_
+            ivar = 1 / np.sqrt(np.diag(cov))
+            weights = ivar / ivar.sum()
+            w.loc[df_subset.index] = weights
+
+    elif portfolio_type == 'short_only':
+        assets = df_subset[self.asset_col].unique()
+        ret = get_returns(assets)
+        if ret.shape[0] >= 2:
+            cov = LedoitWolf().fit(ret.values).covariance_
+            ivar = 1 / np.sqrt(np.diag(cov))
+            weights = -ivar / ivar.sum()
+            w.loc[df_subset.index] = weights
+
+    elif portfolio_type == 'long_short':
+        longs = df_subset[df_subset[signal_col] > 0]
+        shorts = df_subset[df_subset[signal_col] < 0]
+
+        if not longs.empty:
+            ret_long = get_returns(longs[self.asset_col].unique())
+            if ret_long.shape[0] >= 2:
+                cov_long = LedoitWolf().fit(ret_long.values).covariance_
+                ivar_long = 1 / np.sqrt(np.diag(cov_long))
+                w_long = ivar_long / ivar_long.sum() * 0.5
+                w.loc[longs.index] = w_long
+
+        if not shorts.empty:
+            ret_short = get_returns(shorts[self.asset_col].unique())
+            if ret_short.shape[0] >= 2:
+                cov_short = LedoitWolf().fit(ret_short.values).covariance_
+                ivar_short = 1 / np.sqrt(np.diag(cov_short))
+                w_short = -ivar_short / ivar_short.sum() * 0.5
+                w.loc[shorts.index] = w_short
+
+    elif portfolio_type == 'q5_q1':
+        df_q = df_subset.copy()
+        df_q['quantile'] = pd.qcut(df_q[signal_col], 5, labels=False) + 1
+        top = df_q[df_q['quantile'] == df_q['quantile'].max()]
+        bottom = df_q[df_q['quantile'] == df_q['quantile'].min()]
+
+        if not top.empty:
+            ret_top = get_returns(top[self.asset_col].unique())
+            if ret_top.shape[0] >= 2:
+                cov_top = LedoitWolf().fit(ret_top.values).covariance_
+                ivar_top = 1 / np.sqrt(np.diag(cov_top))
+                w_top = ivar_top / ivar_top.sum() * 0.5
+                w.loc[top.index] = w_top
+
+        if not bottom.empty:
+            ret_bot = get_returns(bottom[self.asset_col].unique())
+            if ret_bot.shape[0] >= 2:
+                cov_bot = LedoitWolf().fit(ret_bot.values).covariance_
+                ivar_bot = 1 / np.sqrt(np.diag(cov_bot))
+                w_bot = -ivar_bot / ivar_bot.sum() * 0.5
+                w.loc[bottom.index] = w_bot
+
+    else:
+        raise ValueError(f"Unsupported portfolio_type: {portfolio_type}")
+
+    return w
 
 # utiles.py
 import pandas as pd
