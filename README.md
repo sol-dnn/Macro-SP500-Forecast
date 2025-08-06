@@ -1,21 +1,132 @@
-        # filter by currency if provided
-        df_filt = df.copy()
-        # convert percentage returns into decimal form
-        df_filt[self.ret_col] = df_filt[self.ret_col] / 100
-        if currency is not None:
-            df_filt = df_filt[df_filt['instrmtccy'] == currency]
-        if currency is not None:
-            df_filt = df_filt[df_filt['instrmtccy'] == currency]
+import pandas as pd
+import numpy as np
+from sklearn.covariance import LedoitWolf
 
-        # build master universe DataFrame with returns and MSCI weights
-        self.master_df = (
-            df_filt[[date_col, asset_col, ret_col, mscicol]]
-            .drop_duplicates()
-            .sort_values([date_col, asset_col])
+class MyStrategy:
+    def __init__(self,
+                 signal_data: pd.DataFrame,
+                 returns_history: pd.DataFrame,
+                 date_col: str = 'Date',
+                 asset_col: str = 'Asset'):
+        self.data = signal_data
+        self.returns_history = returns_history
+        self.date_col = date_col
+        self.asset_col = asset_col
+
+    def build_portfolio(self,
+                        signal_col: str,
+                        portfolio_type: str,
+                        weight_type: str = 'equal') -> pd.DataFrame:
+        df = self.data.dropna(subset=[signal_col]).copy()
+
+        def process_group(group: pd.DataFrame) -> pd.DataFrame:
+            group = group.copy()
+            group['weight'] = 0.0
+            # select subset based on portfolio type
+            if portfolio_type == 'long_only':
+                sel = group[group[signal_col] > 0]
+            elif portfolio_type == 'short_only':
+                sel = group[group[signal_col] < 0]
+            elif portfolio_type == 'long_short':
+                sel = pd.concat([group[group[signal_col] > 0], group[group[signal_col] < 0]])
+            elif portfolio_type == 'q5_q1':
+                group['quantile'] = pd.qcut(group[signal_col], 5, labels=False) + 1
+                top = group[group['quantile'] == group['quantile'].max()]
+                bottom = group[group['quantile'] == group['quantile'].min()]
+                sel = pd.concat([top, bottom])
+            else:
+                raise ValueError(f"Unknown portfolio_type: {portfolio_type}")
+            # compute weights
+            weights = self._compute_weights(sel, signal_col, weight_type, portfolio_type)
+            group.loc[sel.index, 'weight'] = weights.values
+            return group
+
+        result = (
+            df.groupby(self.date_col)
+              .apply(process_group)
+              .reset_index(drop=True)
         )
+        return result
 
-        # also store full feature DataFrame for signal merging
-        self.df = df_filt.copy()
+    def _compute_weights(self,
+                         df_subset: pd.DataFrame,
+                         signal_col: str,
+                         weight_type: str,
+                         portfolio_type: str) -> pd.Series:
+        if weight_type == 'equal':
+            return pd.Series(1.0 / len(df_subset), index=df_subset.index)
+        elif weight_type == 'signal':
+            raw = df_subset[signal_col]
+            return raw / raw.abs().sum()
+        elif weight_type == 'erc':
+            return self._erc_weights(df_subset, signal_col, portfolio_type)
+        else:
+            raise ValueError(f"Unknown weight_type: {weight_type}")
+
+    def _erc_weights(self,
+                     df_subset: pd.DataFrame,
+                     signal_col: str,
+                     portfolio_type: str,
+                     window_months: int = 36) -> pd.Series:
+        current_date = df_subset[self.date_col].iloc[0]
+
+        # Sélection des actifs selon le portefeuille
+        if portfolio_type == 'long_only':
+            df_in = df_subset[df_subset[signal_col] > 0]
+        elif portfolio_type == 'short_only':
+            df_in = df_subset[df_subset[signal_col] < 0]
+        elif portfolio_type in ['long_short', 'q5_q1']:
+            df_in = df_subset.copy()
+        else:
+            raise ValueError(f"Unsupported portfolio_type: {portfolio_type}")
+
+        assets = df_in[self.asset_col].unique()
+        if len(assets) == 0:
+            return pd.Series(0.0, index=df_subset.index)
+
+        # Récupérer les rendements historiques passés dans la fenêtre
+        window_start = current_date - pd.DateOffset(months=window_months)
+        hist_returns = self.returns_history[
+            (self.returns_history[self.date_col] < current_date) &
+            (self.returns_history[self.date_col] >= window_start) &
+            (self.returns_history[self.asset_col].isin(assets))
+        ]
+
+        # Pivot format large
+        ret_wide = hist_returns.pivot(index=self.date_col,
+                                      columns=self.asset_col,
+                                      values='Return')
+        ret_sel = ret_wide.dropna(how='any')
+        if ret_sel.shape[0] < 2:
+            return pd.Series(0.0, index=df_subset.index)
+
+        # Estimation de covariance régulière
+        cov = LedoitWolf().fit(ret_sel.values).covariance_
+
+        # Approximation ERC = inverse de la volatilité
+        ivar = 1 / np.sqrt(np.diag(cov))
+        raw_w = ivar / np.sum(ivar)
+
+        if portfolio_type == 'short_only':
+            raw_w = -raw_w
+
+        if portfolio_type == 'long_short':
+            raw_w = np.sign(raw_w) * np.abs(raw_w) / 2
+
+        if portfolio_type == 'q5_q1':
+            top_assets = df_subset[df_subset['quantile'] == df_subset['quantile'].max()][self.asset_col]
+            bot_assets = df_subset[df_subset['quantile'] == df_subset['quantile'].min()][self.asset_col]
+            mask = [a in top_assets.values for a in ret_sel.columns]
+            w_top = raw_w[mask]
+            w_bot = raw_w[[not m for m in mask]]
+            w = np.zeros_like(raw_w)
+            w[mask] = w_top / np.sum(np.abs(w_top)) * 0.5
+            w[[not m for m in mask]] = -w_bot / np.sum(np.abs(w_bot)) * 0.5
+            raw_w = w
+
+        w_series = pd.Series(raw_w, index=ret_sel.columns)
+        return df_subset[self.asset_col].map(w_series).fillna(0.0)
+
 
 # utiles.py
 import pandas as pd
