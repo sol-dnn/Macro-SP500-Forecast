@@ -1,69 +1,56 @@
-import pandas as pd
-import numpy as np
+from sklearn.linear_model import Lasso
+from sklearn.model_selection import GridSearchCV
 
-# --- 1. Préparation et calcul du biais ---
-df['date'] = pd.to_datetime(df['date'])
-df = df.sort_values('date').reset_index(drop=True)
+param_grid = {
+    'alpha': [1e-3, 1e-2, 1e-1, 1, 10],
+    'fit_intercept': [True, False],  
+}
 
-# Biais défini comme (réel – estimate) / prix
-df['bias'] = (
-    df['target_eps_ltm_12m']
-    - df['ic_estimate_eps_mean_ntm_twa']
-) / df['quoteclose']
 
-# Création des quintiles de valorisation par date
-df['valuation_ratio'] = df['quoteclose'] / df['marketvalue']
-df['valuation_quintile'] = (
-    df.groupby('date')['valuation_ratio']
-      .transform(lambda x: pd.qcut(x, 5, labels=False, duplicates='drop') + 1)
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import GridSearchCV
+
+param_grid = {
+    'alpha': [1e-3, 1e-2, 1e-1, 1, 10, 100],
+    'solver': ['auto', 'saga'],
+}
+
+import xgboost as xgb
+from sklearn.model_selection import GridSearchCV
+
+xgb_model = xgb.XGBRegressor(tree_method='hist',  
+                             objective='reg:absoluteerror',  # ou 'reg:squarederror'
+                             n_jobs=-1,
+                             random_state=42)
+
+param_grid = {
+    'n_estimators': [100, 300, 500],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'max_depth': [3, 5, 7],
+    'subsample': [0.7, 1.0],
+    'colsample_bytree': [0.7, 1.0],
+    'reg_alpha': [0, 0.1, 1],
+    'reg_lambda': [1, 5, 10]
+}
+
+
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.model_selection import GridSearchCV
+
+et = ExtraTreesRegressor(
+    criterion='absolute_error',  # MAE
+    n_jobs=-1,
+    random_state=42
 )
 
-# --- 2. Pré-allocation des colonnes de prédiction naïve ---
-df['naive_ibes_minus_mean_bias']     = np.nan
-df['naive_ibes_minus_mean_bias_val'] = np.nan
-df['naive_ibes_minus_mean_bias_sec'] = np.nan
+param_grid = {
+    'n_estimators': [100, 300, 500],
+    'max_depth': [None, 10, 20],
+    'min_samples_split': [2, 5, 10],
+    'min_samples_leaf': [1, 2, 4],
+    'max_features': ['auto', 'sqrt', 0.5]
+}
 
-# --- 3. Boucle sur chaque date pour calculer la fenêtre 24 mois et les moyennes ---
-for current_date in df['date'].drop_duplicates().sort_values():
-    window_start = current_date - pd.DateOffset(months=24)
-    mask_win = (df['date'] > window_start) & (df['date'] < current_date)
-    win = df.loc[mask_win]
-    if win.empty:
-        continue
-
-    # a) moyenne des biais sur les 24 derniers mois
-    global_mean = win['bias'].mean()
-
-    # b) moyenne des biais par quintile de valorisation
-    val_mean = win.groupby('valuation_quintile')['bias'].mean()
-
-    # c) moyenne des biais par secteur
-    sec_mean = win.groupby('GICS_sector_name')['bias'].mean()
-
-    # d) assignation pour toutes les lignes du mois current_date
-    mask_curr = df['date'] == current_date
-
-    # prédiction naïve globale
-    df.loc[mask_curr, 'naive_ibes_minus_mean_bias'] = (
-        df.loc[mask_curr, 'ic_estimate_eps_mean_ntm_twa'] 
-        - global_mean
-    )
-
-    # prédiction naïve par quintile
-    for q, m in val_mean.items():
-        sel = mask_curr & (df['valuation_quintile'] == q)
-        df.loc[sel, 'naive_ibes_minus_mean_bias_val'] = (
-            df.loc[sel, 'ic_estimate_eps_mean_ntm_twa'] 
-            - m
-        )
-
-    # prédiction naïve par secteur
-    for sec, m in sec_mean.items():
-        sel = mask_curr & (df['GICS_sector_name'] == sec)
-        df.loc[sel, 'naive_ibes_minus_mean_bias_sec'] = (
-            df.loc[sel, 'ic_estimate_eps_mean_ntm_twa'] 
-            - m
-        )
 
 # utiles.py
 import pandas as pd
