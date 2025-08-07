@@ -1,58 +1,84 @@
 import pandas as pd
 import numpy as np
 
-# Assurer bon format date et tri
+# Préparation
 df['date'] = pd.to_datetime(df['date'])
-df = df.sort_values(['date'])
+df = df.sort_values('date').reset_index(drop=True)
 
-# Biais de prévision
-df['bias'] = (df['target_eps_ltm_12m'] - df['ic_estimate_eps_mean_ntm_twa']) / df['quoteclose']
+# Calcul du biais analyste
+df['bias'] = (
+    df['target_eps_ltm_12m']
+    - df['ic_estimate_eps_mean_ntm_twa']
+) / df['quoteclose']
 
-# Ratio de valorisation : prix / capitalisation
+# Quintiles de valorisation par date
 df['valuation_ratio'] = df['quoteclose'] / df['marketvalue']
-
-# Quintiles de valorisation par date (cross-sectionnel)
-df['valuation_quintile'] = df.groupby('date')['valuation_ratio'].transform(
-    lambda x: pd.qcut(x, 5, labels=False, duplicates='drop') + 1
+df['valuation_quintile'] = (
+    df.groupby('date')['valuation_ratio']
+      .transform(lambda x: pd.qcut(x, 5, labels=False, duplicates='drop') + 1)
 )
 
-# --- Fonctions utilitaires rolling ---
-def rolling_group_bias(df, group_cols, bias_col='bias', win=24, method='mean'):
-    """
-    Calcule la moyenne ou médiane du biais sur 24 mois glissants pour chaque groupe (e.g., secteur, quintile)
-    """
-    df = df.sort_values(['date'])
-    grouped = df.groupby(group_cols)
-    if method == 'mean':
-        return grouped[bias_col].transform(lambda x: x.shift(1).rolling(win, min_periods=12).mean())
-    elif method == 'median':
-        return grouped[bias_col].transform(lambda x: x.shift(1).rolling(win, min_periods=12).median())
-    else:
-        raise ValueError("Method must be 'mean' or 'median'")
+# Pré-allocation des colonnes de rolling bias
+for lvl in ['global', 'val', 'sector', 'ticker']:
+    for stat in ['mean', 'median']:
+        df[f'bias_{lvl}_{stat}_24m'] = np.nan
 
-# --- Biais Global (mean & median) ---
-df['bias_global_mean_24m'] = df['bias'].shift(1).rolling(window=24, min_periods=12).mean()
-df['bias_global_median_24m'] = df['bias'].shift(1).rolling(window=24, min_periods=12).median()
+# Boucle sur chaque date
+for current_date in df['date'].drop_duplicates().sort_values():
+    window_start = current_date - pd.DateOffset(months=24)
+    mask_win = (df['date'] > window_start) & (df['date'] < current_date)
+    win = df.loc[mask_win]
 
-# --- Biais par quintile de valorisation ---
-df['bias_val_mean_24m'] = rolling_group_bias(df, ['valuation_quintile'], method='mean')
-df['bias_val_median_24m'] = rolling_group_bias(df, ['valuation_quintile'], method='median')
+    #  ▶︎ ne calculer que si on a au moins 24 mois distincts
+    n_months = win['date'].dt.to_period('M').nunique()
+    if n_months < 24:
+        continue
 
-# --- Biais par secteur ---
-df['bias_sector_mean_24m'] = rolling_group_bias(df, ['GICS_sector_name'], method='mean')
-df['bias_sector_median_24m'] = rolling_group_bias(df, ['GICS_sector_name'], method='median')
+    # Calcul des biais sur la fenêtre valide
+    g_mean = win['bias'].mean()
+    g_med  = win['bias'].median()
 
-# --- Facultatif : Biais par titre (sedolcd) ---
-df['bias_ticker_mean_24m'] = rolling_group_bias(df, ['sedolcd'], method='mean')
-df['bias_ticker_median_24m'] = rolling_group_bias(df, ['sedolcd'], method='median')
+    vb = win.groupby('valuation_quintile')['bias']
+    val_mean = vb.mean();    val_med  = vb.median()
 
-# --- Génération des prédictions corrigées (6 modèles) ---
-for level in ['global', 'val', 'sector', 'ticker']:
-    for method in ['mean', 'median']:
-        bias_col = f'bias_{level}_{method}_24m'
-        pred_col = f'naive_pred_{level}_{method}'
-        df[pred_col] = df['ic_estimate_eps_mean_ntm_twa'] + df[bias_col] * df['quoteclose']
+    sb = win.groupby('GICS_sector_name')['bias']
+    sec_mean = sb.mean();    sec_med  = sb.median()
 
+    tb = win.groupby('sedolcd')['bias']
+    tic_mean = tb.mean();    tic_med  = tb.median()
+
+    # Assignation des biais calculés aux lignes du mois courant
+    mask_curr = df['date'] == current_date
+    df.loc[mask_curr, 'bias_global_mean_24m']   = g_mean
+    df.loc[mask_curr, 'bias_global_median_24m'] = g_med
+
+    for q, m in val_mean.items():
+        sel = mask_curr & (df['valuation_quintile'] == q)
+        df.loc[sel, 'bias_val_mean_24m']   = m
+        df.loc[sel, 'bias_val_median_24m'] = val_med.loc[q]
+
+    for sec, m in sec_mean.items():
+        sel = mask_curr & (df['GICS_sector_name'] == sec)
+        df.loc[sel, 'bias_sector_mean_24m']   = m
+        df.loc[sel, 'bias_sector_median_24m'] = sec_med.loc[sec]
+
+    for tic, m in tic_mean.items():
+        sel = mask_curr & (df['sedolcd'] == tic)
+        df.loc[sel, 'bias_ticker_mean_24m']   = m
+        df.loc[sel, 'bias_ticker_median_24m'] = tic_med.loc[tic]
+
+# Construction des prédictions naïves corrigées
+for lvl, col_suffix in [
+    ('global', ''), ('val', '_val'),
+    ('sector', '_sector'), ('ticker', '_ticker')
+]:
+    for stat in ['mean', 'median']:
+        bias_col = f'bias_{lvl}_{stat}_24m'
+        pred_col = f'naive_pred{col_suffix}_{stat}'
+        df[pred_col] = (
+            df['ic_estimate_eps_mean_ntm_twa']
+            + df[bias_col] * df['quoteclose']
+        )
 
 
 # utiles.py
