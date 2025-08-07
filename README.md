@@ -1,85 +1,69 @@
 import pandas as pd
 import numpy as np
 
-# Préparation
+# --- 1. Préparation et calcul du biais ---
 df['date'] = pd.to_datetime(df['date'])
 df = df.sort_values('date').reset_index(drop=True)
 
-# Calcul du biais analyste
+# Biais défini comme (réel – estimate) / prix
 df['bias'] = (
     df['target_eps_ltm_12m']
     - df['ic_estimate_eps_mean_ntm_twa']
 ) / df['quoteclose']
 
-# Quintiles de valorisation par date
+# Création des quintiles de valorisation par date
 df['valuation_ratio'] = df['quoteclose'] / df['marketvalue']
 df['valuation_quintile'] = (
     df.groupby('date')['valuation_ratio']
       .transform(lambda x: pd.qcut(x, 5, labels=False, duplicates='drop') + 1)
 )
 
-# Pré-allocation des colonnes de rolling bias
-for lvl in ['global', 'val', 'sector', 'ticker']:
-    for stat in ['mean', 'median']:
-        df[f'bias_{lvl}_{stat}_24m'] = np.nan
+# --- 2. Pré-allocation des colonnes de prédiction naïve ---
+df['naive_ibes_minus_mean_bias']     = np.nan
+df['naive_ibes_minus_mean_bias_val'] = np.nan
+df['naive_ibes_minus_mean_bias_sec'] = np.nan
 
-# Boucle sur chaque date
+# --- 3. Boucle sur chaque date pour calculer la fenêtre 24 mois et les moyennes ---
 for current_date in df['date'].drop_duplicates().sort_values():
     window_start = current_date - pd.DateOffset(months=24)
     mask_win = (df['date'] > window_start) & (df['date'] < current_date)
     win = df.loc[mask_win]
-
-    #  ▶︎ ne calculer que si on a au moins 24 mois distincts
-    n_months = win['date'].dt.to_period('M').nunique()
-    if n_months < 24:
+    if win.empty:
         continue
 
-    # Calcul des biais sur la fenêtre valide
-    g_mean = win['bias'].mean()
-    g_med  = win['bias'].median()
+    # a) moyenne des biais sur les 24 derniers mois
+    global_mean = win['bias'].mean()
 
-    vb = win.groupby('valuation_quintile')['bias']
-    val_mean = vb.mean();    val_med  = vb.median()
+    # b) moyenne des biais par quintile de valorisation
+    val_mean = win.groupby('valuation_quintile')['bias'].mean()
 
-    sb = win.groupby('GICS_sector_name')['bias']
-    sec_mean = sb.mean();    sec_med  = sb.median()
+    # c) moyenne des biais par secteur
+    sec_mean = win.groupby('GICS_sector_name')['bias'].mean()
 
-    tb = win.groupby('sedolcd')['bias']
-    tic_mean = tb.mean();    tic_med  = tb.median()
-
-    # Assignation des biais calculés aux lignes du mois courant
+    # d) assignation pour toutes les lignes du mois current_date
     mask_curr = df['date'] == current_date
-    df.loc[mask_curr, 'bias_global_mean_24m']   = g_mean
-    df.loc[mask_curr, 'bias_global_median_24m'] = g_med
 
+    # prédiction naïve globale
+    df.loc[mask_curr, 'naive_ibes_minus_mean_bias'] = (
+        df.loc[mask_curr, 'ic_estimate_eps_mean_ntm_twa'] 
+        - global_mean
+    )
+
+    # prédiction naïve par quintile
     for q, m in val_mean.items():
         sel = mask_curr & (df['valuation_quintile'] == q)
-        df.loc[sel, 'bias_val_mean_24m']   = m
-        df.loc[sel, 'bias_val_median_24m'] = val_med.loc[q]
-
-    for sec, m in sec_mean.items():
-        sel = mask_curr & (df['GICS_sector_name'] == sec)
-        df.loc[sel, 'bias_sector_mean_24m']   = m
-        df.loc[sel, 'bias_sector_median_24m'] = sec_med.loc[sec]
-
-    for tic, m in tic_mean.items():
-        sel = mask_curr & (df['sedolcd'] == tic)
-        df.loc[sel, 'bias_ticker_mean_24m']   = m
-        df.loc[sel, 'bias_ticker_median_24m'] = tic_med.loc[tic]
-
-# Construction des prédictions naïves corrigées
-for lvl, col_suffix in [
-    ('global', ''), ('val', '_val'),
-    ('sector', '_sector'), ('ticker', '_ticker')
-]:
-    for stat in ['mean', 'median']:
-        bias_col = f'bias_{lvl}_{stat}_24m'
-        pred_col = f'naive_pred{col_suffix}_{stat}'
-        df[pred_col] = (
-            df['ic_estimate_eps_mean_ntm_twa']
-            + df[bias_col] * df['quoteclose']
+        df.loc[sel, 'naive_ibes_minus_mean_bias_val'] = (
+            df.loc[sel, 'ic_estimate_eps_mean_ntm_twa'] 
+            - m
         )
 
+    # prédiction naïve par secteur
+    for sec, m in sec_mean.items():
+        sel = mask_curr & (df['GICS_sector_name'] == sec)
+        df.loc[sel, 'naive_ibes_minus_mean_bias_sec'] = (
+            df.loc[sel, 'ic_estimate_eps_mean_ntm_twa'] 
+            - m
+        )
 
 # utiles.py
 import pandas as pd
