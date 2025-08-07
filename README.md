@@ -1,32 +1,45 @@
-from scipy.optimize import minimize
+import pandas as pd
+import numpy as np
 
-def _solve_erc(self, cov: np.ndarray) -> np.ndarray:
-    """
-    Solve for true ERC weights given a covariance matrix.
-    Each asset contributes equally to portfolio risk.
-    """
-    n = cov.shape[0]
-    x0 = np.ones(n) / n
+# S'assurer que la date est bien en datetime et triée
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values(['ticker', 'date'])
 
-    # Constraints: sum of weights = 1
-    cons = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
-    bounds = [(0, 1)] * n  # Long-only
+# 1. Calcul du biais
+df['bias'] = (df['target_eps_ltm_12m'] - df['ic_estimate_eps_mean_ntm_twa']) / df['quoteclose']
 
-    def portfolio_risk_contributions(w, cov):
-        sigma_p = np.sqrt(w @ cov @ w)
-        marginal_contrib = cov @ w
-        risk_contrib = w * marginal_contrib
-        return risk_contrib
+# 2. Création des quintiles de valorisation : Price-to-MarketValue
+df['valuation_ratio'] = df['quoteclose'] / df['marketvalue']
 
-    def objective(w):
-        rc = portfolio_risk_contributions(w, cov)
-        return np.sum((rc - rc.mean())**2)  # Minimize risk contribution variance
+# Pour chaque date, on crée les quintiles de valorisation cross-sectionnels
+df['valuation_quintile'] = df.groupby('date')['valuation_ratio'].transform(
+    lambda x: pd.qcut(x, 5, labels=False, duplicates='drop') + 1
+)
 
-    result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons)
-    if not result.success:
-        print("ERC optimization failed, fallback to equal weights")
-        return np.ones(n) / n
-    return result.x
+# 3. Calcul du biais moyen glissant sur 24 mois
+
+# a. Biais moyen global (rolling 24 mois)
+df['bias_global_roll'] = (
+    df.groupby('ticker')['bias']
+    .transform(lambda x: x.shift(1).rolling(window=24, min_periods=12).mean())
+)
+
+# b. Biais moyen par quintile de valorisation (rolling)
+df['bias_val_quint_roll'] = (
+    df.groupby(['ticker', 'valuation_quintile'])['bias']
+    .transform(lambda x: x.shift(1).rolling(window=24, min_periods=12).mean())
+)
+
+# c. Biais moyen par secteur (rolling)
+df['bias_sector_roll'] = (
+    df.groupby(['ticker', 'GICS_sector_name'])['bias']
+    .transform(lambda x: x.shift(1).rolling(window=24, min_periods=12).mean())
+)
+
+# 4. Génération des prédictions naïves corrigées
+df['naive_pred_global'] = df['ic_estimate_eps_mean_ntm_twa'] + df['bias_global_roll'] * df['quoteclose']
+df['naive_pred_val']    = df['ic_estimate_eps_mean_ntm_twa'] + df['bias_val_quint_roll'] * df['quoteclose']
+df['naive_pred_sector'] = df['ic_estimate_eps_mean_ntm_twa'] + df['bias_sector_roll'] * df['quoteclose']
 
 # utiles.py
 import pandas as pd
