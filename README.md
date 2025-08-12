@@ -292,6 +292,16 @@ def plot_corr_bar(res_corr, sig_name, title_suffix='Avg CS correlation'):
 #     # print(corr_dict[s])  # to see the table too
 
 
+
+for ccy in ['USD', 'EUR', 'JPY', 'GBP']:
+    df_ccy = df_pred[df_pred['instrmtccy'] == ccy].copy()
+    print(f"\n=== {ccy} ===")
+    run_all_stats(df_ccy, signal_list)
+
+
+
+
+
 # utiles.py
 import pandas as pd
 import numpy as np
