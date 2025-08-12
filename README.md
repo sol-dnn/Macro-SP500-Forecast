@@ -20,13 +20,6 @@ def prepare_signal_analysis_data(
     compute_market=True,            # set False if you already merged an index as mkt_ret_m
     make_sector_dummies=True
 ):
-    """
-    Build exposures used for signal diagnostics and (later) hedging:
-      ret_fwd_1m, SIZE, VALUE, MOM, VOL, mkt_ret_m, BETA, SEC_* dummies.
-
-    Run this **after** you filter by currency/market so the market series and betas
-    match your test universe.
-    """
     d = df.copy()
     d[date_col] = pd.to_datetime(d[date_col])
     d = d.sort_values([id_col, date_col]).reset_index(drop=True)
@@ -42,21 +35,39 @@ def prepare_signal_analysis_data(
     px   = pd.to_numeric(d[price_col], errors='coerce')
     bvps = pd.to_numeric(d[bvps_col],  errors='coerce')
     bm = (bvps / px).replace([np.inf, -np.inf], np.nan)
-    bm = bm.where((bm > 0) & np.isfinite(bm))  # keep positive, finite
+    bm = bm.where((bm > 0) & np.isfinite(bm))
     d['VALUE'] = np.log(bm)
 
-    # ---------- 3) MOM 12-1 (t-12..t-2), log-compounded ----------
     g = d.groupby(id_col, group_keys=False)
-    minp_mom = int(mom_window * min_history_frac)
+    minp_mom  = int(mom_window  * min_history_frac)
+    minp_vol  = int(vol_window  * min_history_frac)
+    minp_beta = int(beta_window * min_history_frac)
+
+    # ---------- 3) MOM 12-1 (t-12..t-2), log-compounded ----------
+    # Build log(1+r), then:
+    # sum over last 12 months up to t-1 (rolling)  MINUS the last month t-1  => exclude t-1
     d['_log1p'] = np.log1p(pd.to_numeric(d[ret_col], errors='coerce'))
-    sum12_up_to_t1 = g['_log1p'].rolling(mom_window, min_periods=minp_mom).sum().shift(1)
-    last1 = g['_log1p'].shift(1)  # subtract t-1 to exclude it
+
+    sum12_up_to_t1 = (
+        g['_log1p']
+        .rolling(mom_window, min_periods=minp_mom)
+        .sum()
+        .shift(1)
+        .reset_index(level=0, drop=True)  # <<< align indices (fix)
+    )
+    last1 = g['_log1p'].shift(1)  # index already flat
+
     d['MOM'] = np.expm1(sum12_up_to_t1 - last1)
     d.drop(columns=['_log1p'], inplace=True)
 
     # ---------- 4) VOL 12m std (t-12..t-1), known at t ----------
-    minp_vol = int(vol_window * min_history_frac)
-    d['VOL'] = g[ret_col].rolling(vol_window, min_periods=minp_vol).std().shift(1)
+    d['VOL'] = (
+        g[ret_col]
+        .rolling(vol_window, min_periods=minp_vol)
+        .std()
+        .shift(1)
+        .reset_index(level=0, drop=True)   # <<< align indices (fix)
+    )
 
     # ---------- 5) Market return per date (universe-consistent) ----------
     if compute_market or 'mkt_ret_m' not in d.columns:
@@ -74,41 +85,39 @@ def prepare_signal_analysis_data(
             raise ValueError("mkt_method must be 'equal' or 'value'")
 
     # ---------- 6) BETA 24m vs that market (exposure), known at t ----------
-    minp_beta = int(beta_window * min_history_frac)
-
     def _rolling_beta_for_group(sub):
         r = pd.to_numeric(sub[ret_col], errors='coerce')
         m = pd.to_numeric(sub['mkt_ret_m'], errors='coerce')
         mu_r = r.rolling(beta_window, min_periods=minp_beta).mean()
         mu_m = m.rolling(beta_window, min_periods=minp_beta).mean()
-        cov = (r*m).rolling(beta_window, min_periods=minp_beta).mean() - mu_r*mu_m
-        var = m.rolling(beta_window, min_periods=minp_beta).var()
+        cov  = (r*m).rolling(beta_window, min_periods=minp_beta).mean() - mu_r*mu_m
+        var  = m.rolling(beta_window, min_periods=minp_beta).var()
         return (cov/var).shift(1)
 
     d['BETA'] = g.apply(_rolling_beta_for_group).reset_index(level=0, drop=True)
 
-    # ---------- 7) Sector dummies for macro-sector hedging ----------
+    # ---------- 7) Sector dummies ----------
     sec_cols = []
     if make_sector_dummies and sector_col in d.columns:
         dummies = pd.get_dummies(d[sector_col], prefix='SEC', drop_first=True, dtype=float)
         d = pd.concat([d, dummies], axis=1)
         sec_cols = dummies.columns.tolist()
 
-    # ---------- 8) Clean numerics ----------
-    for c in ['SIZE','VALUE','MOM','VOL','mkt_ret_m','BETA','ret_fwd_1m']:
+    # ---------- 8) Optional: market-neutral forward return (diagnostics) ----------
+    rm_fwd = d.groupby(date_col)['mkt_ret_m'].transform('first').shift(-1)
+    d['ret_fwd_1m_MN'] = d['ret_fwd_1m'] - d['BETA'] * rm_fwd
+
+    # ---------- 9) Clean numerics ----------
+    for c in ['SIZE','VALUE','MOM','VOL','mkt_ret_m','BETA','ret_fwd_1m','ret_fwd_1m_MN']:
         if c in d.columns:
             d[c] = d[c].replace([np.inf, -np.inf], np.nan)
 
-    # Return controls lists you’ll reuse in FMB or hedging later
-    controls_ff3 = ['SIZE','VALUE']            # FF3-style characteristics (exposures)
-    controls_plus = ['SIZE','VALUE','MOM','VOL','BETA']  # full set incl. beta
-    controls_ff3 += sec_cols                   # add sector dummies if present
-    controls_plus += sec_cols
-
+    controls_ff3  = ['SIZE','VALUE'] + sec_cols
+    controls_full = ['SIZE','VALUE','MOM','VOL','BETA'] + sec_cols
     meta = {
         'sector_dummy_cols': sec_cols,
         'controls_ff3': controls_ff3,
-        'controls_full': controls_plus,
+        'controls_full': controls_full,
         'windows': {'MOM': mom_window, 'VOL': vol_window, 'BETA': beta_window},
         'market_method': mkt_method,
     }
