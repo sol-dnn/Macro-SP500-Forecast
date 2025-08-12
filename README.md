@@ -1,95 +1,118 @@
 import numpy as np
 import pandas as pd
 
-def prepare_risk_premia(
+def prepare_signal_analysis_data(
     df,
+    *,
     id_col='sedolcd',
     date_col='date',
-    ret_col='totalreturn',
+    ret_col='totalreturn',          # simple monthly return, e.g. 0.02
     price_col='raw_quoteclose',
     mcap_col='marketvalue',
     bvps_col='wsf_bps_ltm',
     sector_col='GICS_sector_name',
-    add_mom=True,
-    add_vol=True,
-    add_sector_dummies=True,
-    mom_window=12,
-    vol_window=12,
-    min_frac=0.75,
+    # windows / options
+    mom_window=12,                  # MOM = 12-1
+    vol_window=12,                  # VOL = 12m std
+    beta_window=24,                 # BETA = 24m
+    min_history_frac=0.75,          # min data inside each window
+    mkt_method='equal',             # 'equal' or 'value' (for market return)
+    compute_market=True,            # set False if you already merged an index as mkt_ret_m
+    make_sector_dummies=True
 ):
     """
-    Build firm-level risk-premia exposures for cross-sectional (Fama–MacBeth) regressions.
+    Build exposures used for signal diagnostics and (later) hedging:
+      ret_fwd_1m, SIZE, VALUE, MOM, VOL, mkt_ret_m, BETA, SEC_* dummies.
 
-    Outputs added:
-      - ret_fwd_1m : forward 1M return  (r_{t+1})
-      - SIZE       : ln(Market Cap)
-      - VALUE      : ln(Book/Market) using per-share ratio BVPS/Price
-      - MOM        : (optional) 12-1 momentum (t-12..t-2), log-compounded
-      - VOL        : (optional) 12M rolling std of monthly returns (t-12..t-1)
-      - SEC_*      : (optional) sector dummies from `sector_col`, drop_first=True
-
-    Notes
-    -----
-    • Assumes `ret_col` is a monthly simple return (e.g., 0.02 for +2%).
-    • For VALUE we use ln(BVPS / Price); with consistent per-share fields this equals ln(BE/ME).
-    • Rolling stats use only past data via shift(1) so they are known at time t.
-    • Run this AFTER filtering by currency/market to match your test universe.
+    Run this **after** you filter by currency/market so the market series and betas
+    match your test universe.
     """
     d = df.copy()
     d[date_col] = pd.to_datetime(d[date_col])
     d = d.sort_values([id_col, date_col]).reset_index(drop=True)
 
-    # 0) Forward 1M return (dependent variable for FMB)
+    # ---------- 0) Forward 1M return ----------
     d['ret_fwd_1m'] = d.groupby(id_col)[ret_col].shift(-1)
 
-    # 1) SIZE = ln(Market Cap)
+    # ---------- 1) SIZE: ln(Market Cap) ----------
     mc = pd.to_numeric(d[mcap_col], errors='coerce')
     d['SIZE'] = np.log(mc.replace(0, np.nan))
 
-    # 2) VALUE = ln(Book/Market) via per-share ratio (BVPS / Price)
-    px = pd.to_numeric(d[price_col], errors='coerce')
+    # ---------- 2) VALUE: ln(Book/Market) via per-share BVPS/Price ----------
+    px   = pd.to_numeric(d[price_col], errors='coerce')
     bvps = pd.to_numeric(d[bvps_col],  errors='coerce')
     bm = (bvps / px).replace([np.inf, -np.inf], np.nan)
-    bm = bm.where((bm > 0) & np.isfinite(bm))  # keep only positive, finite
+    bm = bm.where((bm > 0) & np.isfinite(bm))  # keep positive, finite
     d['VALUE'] = np.log(bm)
 
+    # ---------- 3) MOM 12-1 (t-12..t-2), log-compounded ----------
     g = d.groupby(id_col, group_keys=False)
-    minp_mom = int(mom_window * min_frac)
-    minp_vol = int(vol_window * min_frac)
+    minp_mom = int(mom_window * min_history_frac)
+    d['_log1p'] = np.log1p(pd.to_numeric(d[ret_col], errors='coerce'))
+    sum12_up_to_t1 = g['_log1p'].rolling(mom_window, min_periods=minp_mom).sum().shift(1)
+    last1 = g['_log1p'].shift(1)  # subtract t-1 to exclude it
+    d['MOM'] = np.expm1(sum12_up_to_t1 - last1)
+    d.drop(columns=['_log1p'], inplace=True)
 
-    # 3) MOM 12-1: cumulative from t-12..t-2 (exclude t-1)
-    if add_mom:
-        d['_log1p'] = np.log1p(pd.to_numeric(d[ret_col], errors='coerce'))
-        # sum over last 12 months up to t-1, then subtract last month (t-1) to exclude it
-        sum12_up_to_t1 = g['_log1p'].rolling(mom_window, min_periods=minp_mom).sum().shift(1)
-        last1 = g['_log1p'].shift(1)
-        d['MOM'] = np.expm1(sum12_up_to_t1 - last1)
-        d.drop(columns=['_log1p'], inplace=True)
+    # ---------- 4) VOL 12m std (t-12..t-1), known at t ----------
+    minp_vol = int(vol_window * min_history_frac)
+    d['VOL'] = g[ret_col].rolling(vol_window, min_periods=minp_vol).std().shift(1)
 
-    # 4) VOL 12m: std over t-12..t-1, known at t
-    if add_vol:
-        d['VOL'] = g[ret_col].rolling(vol_window, min_periods=minp_vol).std().shift(1)
+    # ---------- 5) Market return per date (universe-consistent) ----------
+    if compute_market or 'mkt_ret_m' not in d.columns:
+        if mkt_method == 'equal':
+            d['mkt_ret_m'] = d.groupby(date_col)[ret_col].transform('mean')
+        elif mkt_method == 'value':
+            def _vw(x):
+                w = pd.to_numeric(x[mcap_col], errors='coerce').to_numpy()
+                r = pd.to_numeric(x[ret_col], errors='coerce').to_numpy()
+                w = np.where(np.isfinite(w) & (w>0), w, np.nan)
+                return np.nan if np.nansum(w)==0 else np.nansum(w*r)/np.nansum(w)
+            mkt = d.groupby(date_col).apply(_vw)
+            d['mkt_ret_m'] = d[date_col].map(mkt)
+        else:
+            raise ValueError("mkt_method must be 'equal' or 'value'")
 
-    # 5) Sector dummies (drop_first to avoid collinearity with intercept)
-    sector_cols = []
-    if add_sector_dummies and sector_col in d.columns:
-        # Create once across the whole frame so columns are consistent across dates
+    # ---------- 6) BETA 24m vs that market (exposure), known at t ----------
+    minp_beta = int(beta_window * min_history_frac)
+
+    def _rolling_beta_for_group(sub):
+        r = pd.to_numeric(sub[ret_col], errors='coerce')
+        m = pd.to_numeric(sub['mkt_ret_m'], errors='coerce')
+        mu_r = r.rolling(beta_window, min_periods=minp_beta).mean()
+        mu_m = m.rolling(beta_window, min_periods=minp_beta).mean()
+        cov = (r*m).rolling(beta_window, min_periods=minp_beta).mean() - mu_r*mu_m
+        var = m.rolling(beta_window, min_periods=minp_beta).var()
+        return (cov/var).shift(1)
+
+    d['BETA'] = g.apply(_rolling_beta_for_group).reset_index(level=0, drop=True)
+
+    # ---------- 7) Sector dummies for macro-sector hedging ----------
+    sec_cols = []
+    if make_sector_dummies and sector_col in d.columns:
         dummies = pd.get_dummies(d[sector_col], prefix='SEC', drop_first=True, dtype=float)
         d = pd.concat([d, dummies], axis=1)
-        sector_cols = dummies.columns.tolist()
+        sec_cols = dummies.columns.tolist()
 
-    # Final numeric clean-up
-    for c in ['SIZE', 'VALUE', 'MOM', 'VOL', 'ret_fwd_1m']:
+    # ---------- 8) Clean numerics ----------
+    for c in ['SIZE','VALUE','MOM','VOL','mkt_ret_m','BETA','ret_fwd_1m']:
         if c in d.columns:
             d[c] = d[c].replace([np.inf, -np.inf], np.nan)
 
-    controls = ['SIZE', 'VALUE']
-    if add_mom: controls.append('MOM')
-    if add_vol: controls.append('VOL')
-    controls += sector_cols  # dummies last
+    # Return controls lists you’ll reuse in FMB or hedging later
+    controls_ff3 = ['SIZE','VALUE']            # FF3-style characteristics (exposures)
+    controls_plus = ['SIZE','VALUE','MOM','VOL','BETA']  # full set incl. beta
+    controls_ff3 += sec_cols                   # add sector dummies if present
+    controls_plus += sec_cols
 
-    return d, controls
-
+    meta = {
+        'sector_dummy_cols': sec_cols,
+        'controls_ff3': controls_ff3,
+        'controls_full': controls_plus,
+        'windows': {'MOM': mom_window, 'VOL': vol_window, 'BETA': beta_window},
+        'market_method': mkt_method,
+    }
+    return d, meta
 
 
 # utiles.py
