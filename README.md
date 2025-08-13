@@ -1,128 +1,75 @@
 import numpy as np
 import pandas as pd
+from scipy import stats
+import matplotlib.pyplot as plt
 
-def prepare_signal_analysis_data(
-    df,
-    *,
-    id_col='sedolcd',
-    date_col='date',
-    ret_col='totalreturn',          # simple monthly return, e.g. 0.02
-    price_col='raw_quoteclose',
-    mcap_col='marketvalue',
-    bvps_col='wsf_bps_ltm',
-    sector_col='GICS_sector_name',
-    # windows / options
-    mom_window=12,                  # MOM = 12-1
-    vol_window=12,                  # VOL = 12m std
-    beta_window=24,                 # BETA = 24m
-    min_history_frac=0.75,          # min data inside each window
-    mkt_method='equal',             # 'equal' or 'value' (for market return)
-    compute_market=True,            # set False if you already merged an index as mkt_ret_m
-    make_sector_dummies=True
-):
-    d = df.copy()
-    d[date_col] = pd.to_datetime(d[date_col])
-    d = d.sort_values([id_col, date_col]).reset_index(drop=True)
+def cs_corr_table(df,
+                  signal_cols,
+                  factor_cols,
+                  *,
+                  date_col='date',
+                  ret_col='ret_fwd_1m',
+                  method='spearman',   # 'spearman' or 'pearson'
+                  min_cs_n=10,         # min names per date to compute a CS corr
+                  plot=False):
+    """
+    Cross-sectional correlations per date between each signal and:
+      - every factor in `factor_cols`
+      - the forward return column `ret_col`
+    Then time-average those CS correlations to a single number per pair.
 
-    # ---------- 0) Forward 1M return ----------
-    d['ret_fwd_1m'] = d.groupby(id_col)[ret_col].shift(-1)
+    Returns: DataFrame with one row per signal.
+             Columns: factor columns + ['RET_FWD_1M'] + ['T_months'].
+             'T_months' is the min number of monthly CS correlations used
+             across all targets for that signal (coverage sanity check).
 
-    # ---------- 1) SIZE: ln(Market Cap) ----------
-    mc = pd.to_numeric(d[mcap_col], errors='coerce')
-    d['SIZE'] = np.log(mc.replace(0, np.nan))
+    If plot=True: prints a barplot per signal (factors + RET_FWD_1M).
+    """
+    assert all(c in df.columns for c in signal_cols), "Some signals missing in df"
+    assert all(c in df.columns for c in factor_cols), "Some factors missing in df"
+    assert ret_col in df.columns, f"{ret_col} missing in df"
 
-    # ---------- 2) VALUE: ln(Book/Market) via per-share BVPS/Price ----------
-    px   = pd.to_numeric(d[price_col], errors='coerce')
-    bvps = pd.to_numeric(d[bvps_col],  errors='coerce')
-    bm = (bvps / px).replace([np.inf, -np.inf], np.nan)
-    bm = bm.where((bm > 0) & np.isfinite(bm))
-    d['VALUE'] = np.log(bm)
+    targets = list(factor_cols) + ['RET_FWD_1M']  # label for readability
+    col_map = {**{c: c for c in factor_cols}, 'RET_FWD_1M': ret_col}
 
-    g = d.groupby(id_col, group_keys=False)
-    minp_mom  = int(mom_window  * min_history_frac)
-    minp_vol  = int(vol_window  * min_history_frac)
-    minp_beta = int(beta_window * min_history_frac)
+    rows = []
+    for sig in signal_cols:
+        corrs = {}
+        Ts = []
+        for tgt in targets:
+            tcol = col_map[tgt]
+            vals = []
+            for dte, cs in df.groupby(date_col):
+                s = cs[sig]
+                f = cs[tcol]
+                m = s.notna() & f.notna()
+                if m.sum() >= min_cs_n:
+                    if method == 'spearman':
+                        vals.append(stats.spearmanr(s[m], f[m]).correlation)
+                    else:
+                        vals.append(np.corrcoef(s[m], f[m])[0, 1])
+            corrs[tgt] = float(np.nanmean(vals)) if len(vals) else np.nan
+            Ts.append(len(vals))
+        # build row
+        row = {**corrs, 'T_months': int(np.nanmin(Ts) if len(Ts) else 0)}
+        row['signal'] = sig
+        rows.append(row)
 
-    # ---------- 3) MOM 12-1 (t-12..t-2), log-compounded ----------
-    # Build log(1+r), then:
-    # sum over last 12 months up to t-1 (rolling)  MINUS the last month t-1  => exclude t-1
-    d['_log1p'] = np.log1p(pd.to_numeric(d[ret_col], errors='coerce'))
+        # optional barplot
+        if plot:
+            xs = [k for k in targets]  # order: factors, then forward return
+            ys = [corrs[k] for k in xs]
+            x = np.arange(len(xs))
+            plt.figure(figsize=(8,3))
+            plt.bar(x, ys)
+            plt.axhline(0, lw=1)
+            plt.xticks(x, xs, rotation=0)
+            plt.title(f'Avg CS {method.title()} corr — {sig}  (T≥{row["T_months"]})')
+            plt.tight_layout()
+            plt.show()
 
-    sum12_up_to_t1 = (
-        g['_log1p']
-        .rolling(mom_window, min_periods=minp_mom)
-        .sum()
-        .shift(1)
-        .reset_index(level=0, drop=True)  # <<< align indices (fix)
-    )
-    last1 = g['_log1p'].shift(1)  # index already flat
-
-    d['MOM'] = np.expm1(sum12_up_to_t1 - last1)
-    d.drop(columns=['_log1p'], inplace=True)
-
-    # ---------- 4) VOL 12m std (t-12..t-1), known at t ----------
-    d['VOL'] = (
-        g[ret_col]
-        .rolling(vol_window, min_periods=minp_vol)
-        .std()
-        .shift(1)
-        .reset_index(level=0, drop=True)   # <<< align indices (fix)
-    )
-
-    # ---------- 5) Market return per date (universe-consistent) ----------
-    if compute_market or 'mkt_ret_m' not in d.columns:
-        if mkt_method == 'equal':
-            d['mkt_ret_m'] = d.groupby(date_col)[ret_col].transform('mean')
-        elif mkt_method == 'value':
-            def _vw(x):
-                w = pd.to_numeric(x[mcap_col], errors='coerce').to_numpy()
-                r = pd.to_numeric(x[ret_col], errors='coerce').to_numpy()
-                w = np.where(np.isfinite(w) & (w>0), w, np.nan)
-                return np.nan if np.nansum(w)==0 else np.nansum(w*r)/np.nansum(w)
-            mkt = d.groupby(date_col).apply(_vw)
-            d['mkt_ret_m'] = d[date_col].map(mkt)
-        else:
-            raise ValueError("mkt_method must be 'equal' or 'value'")
-
-    # ---------- 6) BETA 24m vs that market (exposure), known at t ----------
-    def _rolling_beta_for_group(sub):
-        r = pd.to_numeric(sub[ret_col], errors='coerce')
-        m = pd.to_numeric(sub['mkt_ret_m'], errors='coerce')
-        mu_r = r.rolling(beta_window, min_periods=minp_beta).mean()
-        mu_m = m.rolling(beta_window, min_periods=minp_beta).mean()
-        cov  = (r*m).rolling(beta_window, min_periods=minp_beta).mean() - mu_r*mu_m
-        var  = m.rolling(beta_window, min_periods=minp_beta).var()
-        return (cov/var).shift(1)
-
-    d['BETA'] = g.apply(_rolling_beta_for_group).reset_index(level=0, drop=True)
-
-    # ---------- 7) Sector dummies ----------
-    sec_cols = []
-    if make_sector_dummies and sector_col in d.columns:
-        dummies = pd.get_dummies(d[sector_col], prefix='SEC', drop_first=True, dtype=float)
-        d = pd.concat([d, dummies], axis=1)
-        sec_cols = dummies.columns.tolist()
-
-    # ---------- 8) Optional: market-neutral forward return (diagnostics) ----------
-    rm_fwd = d.groupby(date_col)['mkt_ret_m'].transform('first').shift(-1)
-    d['ret_fwd_1m_MN'] = d['ret_fwd_1m'] - d['BETA'] * rm_fwd
-
-    # ---------- 9) Clean numerics ----------
-    for c in ['SIZE','VALUE','MOM','VOL','mkt_ret_m','BETA','ret_fwd_1m','ret_fwd_1m_MN']:
-        if c in d.columns:
-            d[c] = d[c].replace([np.inf, -np.inf], np.nan)
-
-    controls_ff3  = ['SIZE','VALUE'] + sec_cols
-    controls_full = ['SIZE','VALUE','MOM','VOL','BETA'] + sec_cols
-    meta = {
-        'sector_dummy_cols': sec_cols,
-        'controls_ff3': controls_ff3,
-        'controls_full': controls_full,
-        'windows': {'MOM': mom_window, 'VOL': vol_window, 'BETA': beta_window},
-        'market_method': mkt_method,
-    }
-    return d, meta
-
+    res = pd.DataFrame(rows).set_index('signal')[targets + ['T_months']]
+    return res
 
 # utiles.py
 import pandas as pd
