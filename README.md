@@ -1,157 +1,115 @@
-import numpy as np
-import pandas as pd
-from scipy import stats
-import matplotlib.pyplot as plt
-
-# ---------- helpers ----------
-def stars(p): 
-    return '***' if p < 0.01 else '**' if p < 0.05 else '*' if p < 0.10 else ''
-
-def fama_macbeth(df, y_col, x_cols, date_col='date', min_cs=10):
+def run_quintile_portfolio(
+    self,
+    signals: List[str],
+    metric_key: str = "SR",
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Dict[str, pd.Series]]]]:
     """
-    Monthly cross-sectional OLS. Returns a table with mean coef, sd, se, t, p for each regressor.
-    Drops months where CS sample < min_cs or not enough df.
+    Run backtest par quintile (long-only, equiweight) pour chaque signal.
+    Retourne:
+      - report_df: index=signal, colonnes = {<metric>_Q1..Q5, slope, r2_adj, spearman_rho, alignment}
+      - series_dict: dict[signal][f"Q{q}"] -> séries 'gross', 'cum', 'excess', 'excess_cum', 'turnover'
     """
-    rows = []
-    for dt, cs in df.groupby(date_col):
-        X = cs[x_cols].copy().assign(const=1.0)
-        y = cs[y_col]
-        m = X.notna().all(1) & y.notna()
-        if m.sum() > len(x_cols) + 3 and m.sum() >= min_cs:
-            Xm = X.loc[m].values
-            ym = y.loc[m].values
-            beta = np.linalg.pinv(Xm.T @ Xm) @ (Xm.T @ ym)
-            rows.append(pd.Series(beta, index=X.columns))
-    Bt = pd.DataFrame(rows)
-    out = []
-    for col in Bt.columns:
-        vals = Bt[col].dropna()
-        if vals.size >= 10:
-            mean = vals.mean()
-            sd   = vals.std(ddof=1)
-            se   = sd / np.sqrt(vals.size)
-            t    = mean / se if se > 0 else np.nan
-            p    = 2 * stats.t.sf(np.abs(t), df=vals.size-1) if np.isfinite(t) else np.nan
-            out.append([col, mean, sd, se, t, p, vals.size])
-    res = pd.DataFrame(out, columns=['var','coef_mean','coef_sd','coef_se','t','p','T']).set_index('var')
-    return res
+    reports: List[Dict[str, Any]] = []
+    series_dict: Dict[str, Dict[str, Dict[str, pd.Series]]] = {}
 
-def plot_fmb_bars(res_df, title='', sort=True):
-    """
-    Bar plot of mean coefficients with SD error bars and significance stars.
-    Drops 'const'. Sorts by |coef| for readability (optional).
-    """
-    if res_df is None or res_df.empty:
-        print("Empty regression result.")
-        return
-    res = res_df.drop(index=[i for i in res_df.index if i.lower()=='const'], errors='ignore').copy()
-    if sort:
-        res = res.reindex(res['coef_mean'].abs().sort_values(ascending=False).index)
-    x = np.arange(len(res))
-    h = res['coef_mean'].values
-    e = res['coef_sd'].values
+    # 1) Références (benchmark / univers égal / univers MSCI)
+    if getattr(self, "benchmark_ret", None) is not None:
+        bench_ret = self.benchmark_ret.sort_index()
+        bench_cum = (1 + bench_ret).cumprod()
+        series_dict["benchmark"] = {"gross": bench_ret, "cum": bench_cum}
+    if getattr(self, "vs", None) == "benchmark":
+        if getattr(self, "benchmark_ret", None) is None:
+            raise ValueError("benchmark_ret required when vs='benchmark'.")
+        vs_ret = bench_ret
+    else:
+        univ_ret, univ_cum = self._compute_universe_returns()
+        msci_ret, msci_cum = self._compute_msci_universe_returns()
+        series_dict["universe_equal"] = {"gross": univ_ret, "cum": univ_cum}
+        series_dict["universe_msci"] = {"gross": msci_ret, "cum": msci_cum}
+        # par défaut on évalue vs l'univers MSCI
+        vs_ret = msci_ret
 
-    plt.figure(figsize=(10,4))
-    plt.bar(x, h)
-    plt.errorbar(x, h, yerr=e, fmt='none', capsize=4)
-    for xi, (hi, pi) in enumerate(zip(h, res['p'].values)):
-        if np.isfinite(hi):
-            plt.text(xi, hi + (0.02 if hi>=0 else -0.02), stars(pi), ha='center',
-                     va='bottom' if hi>=0 else 'top', fontsize=10)
-    plt.axhline(0, lw=1)
-    plt.xticks(x, res.index, rotation=0)
-    plt.title(title)
-    plt.tight_layout()
-    plt.show()
+    # 2) Boucle sur chaque signal
+    for sig in signals:
+        # a) Univers MSCI éligible (fin de mois) + merge signal
+        eligible = self.master_df[self.master_df[self.mscicol] > 0]
+        df_sig = eligible.drop(columns=[self.mscicol]).merge(
+            self.df_, on=[self.date_col, self.asset_col], how="left"
+        )
 
-def run_fmb_and_report(df, signal_cols, controls=None, *, 
-                       date_col='date',
-                       y_raw='ret_fwd_1m',
-                       y_mn='ret_fwd_1m_MN',
-                       use_market_neutral=False,
-                       plot=False):
-    """
-    For each signal:
-      - run univariate FMB:   y ~ signal
-      - run multivariate FMB: y ~ signal + controls
-    Returns:
-      uni_summary:  DataFrame (rows = signals; cols = coef, t, p, stars, T)  [signal-only]
-      multi_summary: DataFrame (rows = signals; cols = coef, t, p, stars, T, controls_used)
-      uni_tables:   dict signal -> full regression table (all vars)
-      multi_tables: dict signal -> full regression table (all vars)
-    If plot=True: plots bar charts for full univariate & multivariate results per signal.
-    """
-    y_col = y_mn if use_market_neutral and (y_mn in df.columns) else y_raw
-    if controls is None:
-        controls = []  # no controls if not provided
+        pb = PortfolioBuilder(
+            data=df_sig,
+            date_col=self.date_col,
+            asset_col=self.asset_col,
+            returns_history=self.returns_history,  # même param que chez toi
+        )
+        df_w_sub = pb.build_quintile_portfolios(signal_col=sig)
 
-    uni_rows, multi_rows = [], []
-    uni_tables, multi_tables = {}, {}
+        # b) Métrique par quintile
+        q_metrics = {}
+        series_dict.setdefault(sig, {})
 
-    for sig in signal_cols:
-        # --- univariate ---
-        res_uni = fama_macbeth(df, y_col=y_col, x_cols=[sig], date_col=date_col)
-        uni_tables[sig] = res_uni
-        if sig in res_uni.index:
-            r = res_uni.loc[sig]
-            uni_rows.append({
-                'signal': sig,
-                'coef': r['coef_mean'],
-                't': r['t'],
-                'p': r['p'],
-                'stars': stars(r['p']) if np.isfinite(r['p']) else '',
-                'T': int(r['T'])
-            })
-        else:
-            uni_rows.append({'signal': sig, 'coef': np.nan, 't': np.nan, 'p': np.nan, 'stars':'', 'T':0})
+        for q in range(1, 6):
+            df_q = df_w_sub[df_w_sub["quantile"] == q]
 
-        # --- multivariate ---
-        ctrls_present = [c for c in controls if c in df.columns and df[c].notna().any()]
-        res_multi = fama_macbeth(df, y_col=y_col, x_cols=[sig] + ctrls_present, date_col=date_col)
-        multi_tables[sig] = res_multi
-        if sig in res_multi.index:
-            r = res_multi.loc[sig]
-            multi_rows.append({
-                'signal': sig,
-                'coef': r['coef_mean'],
-                't': r['t'],
-                'p': r['p'],
-                'stars': stars(r['p']) if np.isfinite(r['p']) else '',
-                'T': int(r['T']),
-                'controls_used': ','.join(ctrls_present)
-            })
-        else:
-            multi_rows.append({'signal': sig, 'coef': np.nan, 't': np.nan, 'p': np.nan, 'stars':'',
-                               'T':0, 'controls_used': ','.join(ctrls_present)})
+            # Reindex sur tout l'univers; poids manquants à 0
+            df_w = (
+                self.master_df.merge(
+                    df_q[[self.date_col, self.asset_col, "weight"]],
+                    on=[self.date_col, self.asset_col],
+                    how="left",
+                )
+                .fillna({"weight": 0.0})
+            )
 
-        # --- optional plots ---
-        if plot:
-            plot_fmb_bars(res_uni,  f'FMB — {sig} alone ({y_col})')
-            plot_fmb_bars(res_multi,f'FMB — {sig} + controls ({y_col})')
+            # c) Séries de perf et turnover
+            gross = self._align_returns(df_w)
+            turnover = self._compute_turnover(df_w)
 
-    uni_summary   = pd.DataFrame(uni_rows).set_index('signal')
-    multi_summary = pd.DataFrame(multi_rows).set_index('signal')
-    return uni_summary, multi_summary, uni_tables, multi_tables
+            # d) Stockage pour plotting
+            series_dict[sig][f"Q{q}"] = {
+                "gross": gross,
+                "cum": (1 + gross).cumprod(),
+                "turnover": turnover,
+                "excess": (gross - vs_ret).reindex(gross.index),
+                "excess_cum": (1 + (gross - vs_ret)).reindex(gross.index).cumprod(),
+            }
 
-# choose your signals and controls
-SIGNALS  = ['FWD_EY','PEG_INV','SURPRISE_NTM']       # example
-CONTROLS = ['SIZE','VALUE','MOM','VOL','BETA']       # keep only those you prepared
+            # e) Métriques vs référence
+            g_met = self._compute_metrics(gross, vs_ret)
+            if metric_key not in g_met:
+                raise KeyError(f"Métrique '{metric_key}' absente de _compute_metrics.")
+            q_metrics[f"{metric_key}_Q{q}"] = g_met[metric_key]
 
-# run with raw forward returns
-uni_sum, multi_sum, uni_tbls, multi_tbls = run_fmb_and_report(
-    df_factors, SIGNALS, controls=CONTROLS, use_market_neutral=False, plot=False
-)
+        # f) Régression linéaire: métrique ~ quintile (1..5)
+        x = np.arange(1, 6, dtype=float)
+        y = np.array([q_metrics[f"{metric_key}_Q{i}"] for i in range(1, 6)], dtype=float)
 
-print("Univariate (signal alone):")
-display(uni_sum)    # one row per signal: coef, t, p, stars, T
+        slope, intercept = np.polyfit(x, y, 1)
+        y_hat = intercept + slope * x
+        ss_res = np.sum((y - y_hat) ** 2)
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+        n, p = 5, 1
+        r2_adj = 1.0 - (1.0 - r2) * (n - 1) / (n - p - 1) if n > p + 1 and np.isfinite(r2) else np.nan
 
-print("Multivariate (incremental vs controls):")
-display(multi_sum)  # one row per signal: coef, t, p, stars, T, controls_used
+        # g) Alignement (signe de la pente) + Spearman (monotonicité)
+        alignment = int(np.sign(slope))  # +1 bon, -1 mauvais, 0 neutre
+        spearman_rho = pd.Series(x).corr(pd.Series(y), method="spearman")
 
-# optional: plot full details for one signal
-# plot_fmb_bars(uni_tbls['FWD_EY'],  'FMB — FWD_EY alone')
-# plot_fmb_bars(multi_tbls['FWD_EY'],'FMB — FWD_EY + controls')
+        reports.append(
+            {
+                "signal": sig,
+                **q_metrics,
+                "slope": slope,
+                "r2_adj": r2_adj,
+                "spearman_rho": spearman_rho,
+                "alignment": alignment,
+            }
+        )
 
+    report_df = pd.DataFrame(reports).set_index("signal")
+    return report_df, series_dict
 
 
 # utiles.py
