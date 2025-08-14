@@ -1,71 +1,133 @@
-def run_quintile_performance(self, signals: List[str], metric_key: str = "SR") -> pd.DataFrame:
+import numpy as np
+import pandas as pd
+from scipy import stats  # utilisé à la fin pour la 2e fonction
+
+def cs_winsor_zscore_clip(
+    df,
+    signal_cols,
+    *,
+    date_col='date',
+    by=None,                  # ex: 'GICS_sector_name' -> standardisation par (date, secteur)
+    winsor_method='quantile', # 'quantile' ou 'iqr'
+    p_low=0.01, p_high=0.99,  # pour 'quantile'
+    iqr_k=3.0,                # pour 'iqr' -> médiane ± k*IQR
+    clip_at=3.0,              # clip final sur le z-score
+    suffix='_z',              # suffixe des nouvelles colonnes
+    min_group=8               # taille mini pour calculer des stats (sinon NaN)
+):
+    """
+    Pour chaque signal de `signal_cols` :
+      (1) winsor CS par date (et optionnellement par 'by'),
+      (2) z-score CS : (x - mu) / sigma,
+      (3) clip final à [-clip_at, clip_at].
+
+    Retourne: (df_new, new_cols)
+    """
+    d = df.copy()
+    d = d.sort_values([date_col] + ([by] if by else []))
+    group_keys = [date_col] + ([by] if by else [])
+    g = d.groupby(group_keys, group_keys=False)
+
+    new_cols = []
+
+    for col in signal_cols:
+        x = d[col].astype(float)
+
+        # --- Winsor ---
+        if winsor_method == 'quantile':
+            q_low = g[col].transform(lambda s: s.quantile(p_low) if s.notna().sum()>=min_group else np.nan)
+            q_high= g[col].transform(lambda s: s.quantile(p_high) if s.notna().sum()>=min_group else np.nan)
+            x_w = x.where(x >= q_low, q_low)
+            x_w = x_w.where(x_w <= q_high, q_high)
+        elif winsor_method == 'iqr':
+            q1 = g[col].transform(lambda s: s.quantile(0.25) if s.notna().sum()>=min_group else np.nan)
+            q3 = g[col].transform(lambda s: s.quantile(0.75) if s.notna().sum()>=min_group else np.nan)
+            iqr = q3 - q1
+            med = g[col].transform(lambda s: s.median() if s.notna().sum()>=min_group else np.nan)
+            lo = med - iqr_k*iqr
+            hi = med + iqr_k*iqr
+            x_w = x.where(x >= lo, lo)
+            x_w = x_w.where(x_w <= hi, hi)
+        else:
+            raise ValueError("winsor_method must be 'quantile' or 'iqr'")
+
+        # --- Z-score CS ---
+        mu  = g.apply(lambda s: s[col].astype(float)).groupby(group_keys).transform('mean')
+        # mu calculé ci-dessus sur la série brute; on peut aussi utiliser x_w pour être 100% cohérent:
+        mu  = g[x_w.name].transform(lambda s: s.mean())
+        # std sur le winsorisé
+        sig = g[x_w.name].transform(lambda s: s.std(ddof=1))
+        # éviter division par 0
+        z = (x_w - mu) / sig.replace(0, np.nan)
+        z = z.fillna(0.0)  # si std=0 dans un groupe minuscule -> 0
+
+        # --- Clip final ---
+        zc = z.clip(-clip_at, clip_at)
+        out_col = f"{col}{suffix}"
+        d[out_col] = zc
+        new_cols.append(out_col)
+
+    return d, new_cols
+
+
+
+def cs_rank_normal_clip(
+    df,
+    signal_cols,
+    *,
+    date_col='date',
+    by=None,             # ex: 'GICS_sector_name' pour within-sector
+    clip_at=3.5,
+    suffix='_rn',
+    min_group=8
+):
     """
     Pour chaque signal:
-      - calcule la métrique (ex: Sharpe ratio) par quintile Q1..Q5 (long-only, équiweight)
-      - ajuste une régression linéaire métrique ~ quintile
-      - renvoie slope, R² ajusté, Spearman rho, alignement
+      (1) rangs CS par groupe -> quantiles u = (rank-0.5)/n
+      (2) scores normaux z = Phi^{-1}(u)
+      (3) clip à [-clip_at, clip_at]
+    Retourne: (df_new, new_cols)
     """
-    reports = []
+    d = df.copy()
+    d = d.sort_values([date_col] + ([by] if by else []))
+    group_keys = [date_col] + ([by] if by else [])
+    g = d.groupby(group_keys, group_keys=False)
 
-    # Référence
-    if getattr(self, "vs", None) == "benchmark":
-        if getattr(self, "benchmark_ret", None) is None:
-            raise ValueError("benchmark_ret required when vs='benchmark'.")
-        vs_ret = self.benchmark_ret.sort_index()
-    else:
-        _, _ = self._compute_universe_returns()
-        msci_ret, _ = self._compute_msci_universe_returns()
-        vs_ret = msci_ret
+    def _ranknorm(s: pd.Series):
+        z = pd.Series(index=s.index, dtype=float)
+        m = s.notna()
+        n = m.sum()
+        if n < min_group:
+            z[m] = 0.0
+            return z
+        ranks = s[m].rank(method='average')  # 1..n
+        u = (ranks - 0.5) / n                # (0,1)
+        z[m] = stats.norm.ppf(u.clip(1e-6, 1-1e-6))
+        z[~m] = np.nan
+        return z
 
-    for sig in signals:
-        eligible = self.master_df[self.master_df[self.mscicol] > 0]
-        df_sig = eligible.drop(columns=[self.mscicol]).merge(
-            self.df_, on=[self.date_col, self.asset_col], how="left"
-        )
+    new_cols = []
+    for col in signal_cols:
+        z = g[col].transform(_ranknorm)
+        zr = z.clip(-clip_at, clip_at)
+        out_col = f"{col}{suffix}"
+        d[out_col] = zr
+        new_cols.append(out_col)
 
-        pb = PortfolioBuilder(
-            data=df_sig,
-            date_col=self.date_col,
-            asset_col=self.asset_col,
-            returns_history=self.returns_history,
-        )
-        df_w_sub = pb.build_quintile_portfolios(signal_col=sig)
+    return d, new_cols
+# z-score robuste aux outliers (winsor->z->clip) par (date, currency)
+df_z, z_cols = cs_winsor_zscore_clip(
+    df_factors, FACTS,
+    by='instrmtccy',        # ou ['instrmtccy','GICS_sector_name']
+    winsor_method='quantile', p_low=0.01, p_high=0.99, clip_at=3.0
+)
 
-        # métrique par quintile
-        q_metrics = {}
-        for q in range(1, 6):
-            df_q = df_w_sub[df_w_sub["quantile"] == q]
-            df_w = (
-                self.master_df.merge(
-                    df_q[[self.date_col, self.asset_col, "weight"]],
-                    on=[self.date_col, self.asset_col],
-                    how="left",
-                )
-                .fillna({"weight": 0.0})
-            )
-            gross = self._align_returns(df_w)
-            g_met = self._compute_metrics(gross, vs_ret)
-            q_metrics[f"{metric_key}_Q{q}"] = g_met[metric_key]
-
-        # régression linéaire
-        x = np.arange(1, 6, dtype=float)
-        y = np.array([q_metrics[f"{metric_key}_Q{i}"] for i in range(1, 6)], dtype=float)
-        slope, intercept = np.polyfit(x, y, 1)
-        y_hat = intercept + slope * x
-        ss_res = np.sum((y - y_hat) ** 2)
-        ss_tot = np.sum((y - y.mean()) ** 2)
-        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-        n, p = 5, 1
-        r2_adj = 1 - (1 - r2) * (n - 1) / (n - p - 1) if n > p + 1 and np.isfinite(r2) else np.nan
-
-        # alignement + Spearman
-        alignment = int(np.sign(slope))
-        spearman_rho = pd.Series(x).corr(pd.Series(y), method="spearman")
-
-        reports.append({"signal": sig, **q_metrics, "slope": slope, "r2_adj": r2_adj,
-                        "spearman_rho": spearman_rho, "alignment": alignment})
-
-    return pd.DataFrame(reports).set_index("signal")
+# rank->normal par (date, currency)
+df_rn, rn_cols = cs_rank_normal_clip(
+    df_factors, FACTS,
+    by='instrmtccy',        # ou ['instrmtccy','GICS_sector_name']
+    clip_at=3.5
+)
 
 
 # utiles.py
