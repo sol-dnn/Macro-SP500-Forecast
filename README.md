@@ -1,136 +1,172 @@
 import numpy as np
 import pandas as pd
-from scipy import stats  # utilisé à la fin pour la 2e fonction
 
-def cs_winsor_zscore_clip(
+# -----------------------------
+# helpers
+# -----------------------------
+def _as_list(x):
+    if x is None: return []
+    return x if isinstance(x, (list, tuple)) else [x]
+
+def _cs_residualize(df, y_col, x_cols, group_keys, min_cs=10):
+    """
+    Cross-sectional residuals per group: y - X*beta with intercept.
+    Returns a Series aligned to df.index.
+    """
+    out = pd.Series(np.nan, index=df.index, dtype=float)
+    for _, g in df.groupby(group_keys):
+        if len(g) < min_cs:
+            continue
+        X = g[x_cols].copy()
+        X = X.assign(const=1.0)
+        y = g[y_col].astype(float)
+        m = X.notna().all(1) & y.notna()
+        if m.sum() <= len(X.columns) + 2:
+            continue
+        Xm = X.loc[m].values
+        ym = y.loc[m].values
+        beta = np.linalg.pinv(Xm.T @ Xm) @ (Xm.T @ ym)
+        yhat = Xm @ beta
+        resid = ym - yhat
+        out.loc[m.index[m]] = resid
+    return out
+
+# -----------------------------
+# main pipeline
+# -----------------------------
+def make_signal_versions(
     df,
     signal_cols,
     *,
     date_col='date',
-    by=None,                  # ex: 'GICS_sector_name' -> standardisation par (date, secteur)
-    winsor_method='quantile', # 'quantile' ou 'iqr'
-    p_low=0.01, p_high=0.99,  # pour 'quantile'
-    iqr_k=3.0,                # pour 'iqr' -> médiane ± k*IQR
-    clip_at=3.0,              # clip final sur le z-score
-    suffix='_z',              # suffixe des nouvelles colonnes
-    min_group=8               # taille mini pour calculer des stats (sinon NaN)
+    by=None,                        # e.g. 'instrmtccy' or ['instrmtccy','GICS_sector_name']
+    q_low=0.01, q_high=0.99,        # winsor quantiles (cross-sectional)
+    hedges=('none','market','full'),# which versions to build
+    market_factor='BETA',           # used for 'market' hedge
+    full_factors=('BETA','SIZE','VALUE','VOL'),  # used for 'full' hedge
+    clip_at=2.0,                    # final clip on the z-scored series
+    min_group=8,                    # min names per CS group to compute stats
+    min_cs_resid=10                 # min names per CS group to run regression hedge
 ):
     """
-    Pour chaque signal de `signal_cols` :
-      (1) winsor CS par date (et optionnellement par 'by'),
-      (2) z-score CS : (x - mu) / sigma,
-      (3) clip final à [-clip_at, clip_at].
+    For each signal in `signal_cols`, build (per date × by-group):
+      1) cross-sectional winsorization (q_low/q_high),
+      2) hedging by regression residuals:
+           - 'none'   : no hedge
+           - 'market' : hedge on [1, BETA]
+           - 'full'   : hedge on [1, BETA, SIZE, VALUE, VOL] (present columns only)
+      3) cross-sectional z-score
+      4) clip to [-clip_at, clip_at]
 
-    Retourne: (df_new, new_cols)
+    Returns
+    -------
+    df_out : DataFrame (original + new columns)
+    created_cols : dict {signal: [new_col_names]}
     """
-    d = df.copy()
-    d = d.sort_values([date_col] + ([by] if by else []))
-    group_keys = [date_col] + ([by] if by else [])
-    g = d.groupby(group_keys, group_keys=False)
+    df_out = df.copy()
+    group_keys = [date_col] + _as_list(by)
+    g = df_out.groupby(group_keys, group_keys=False)
 
-    new_cols = []
+    # ensure factors exist flags
+    present_full = [c for c in _as_list(full_factors) if c in df_out.columns]
+    do_market = (market_factor in df_out.columns)
 
-    for col in signal_cols:
-        x = d[col].astype(float)
+    # normalize hedge names
+    hedge_list = [h.lower() for h in hedges]
+    valid = {'none','market','full'}
+    if not set(hedge_list).issubset(valid):
+        raise ValueError(f"hedges must be subset of {valid}")
 
-        # --- Winsor ---
-        if winsor_method == 'quantile':
-            q_low = g[col].transform(lambda s: s.quantile(p_low) if s.notna().sum()>=min_group else np.nan)
-            q_high= g[col].transform(lambda s: s.quantile(p_high) if s.notna().sum()>=min_group else np.nan)
-            x_w = x.where(x >= q_low, q_low)
-            x_w = x_w.where(x_w <= q_high, q_high)
-        elif winsor_method == 'iqr':
-            q1 = g[col].transform(lambda s: s.quantile(0.25) if s.notna().sum()>=min_group else np.nan)
-            q3 = g[col].transform(lambda s: s.quantile(0.75) if s.notna().sum()>=min_group else np.nan)
-            iqr = q3 - q1
-            med = g[col].transform(lambda s: s.median() if s.notna().sum()>=min_group else np.nan)
-            lo = med - iqr_k*iqr
-            hi = med + iqr_k*iqr
-            x_w = x.where(x >= lo, lo)
-            x_w = x_w.where(x_w <= hi, hi)
-        else:
-            raise ValueError("winsor_method must be 'quantile' or 'iqr'")
+    created = {}
 
-        # --- Z-score CS ---
-        # --- Z-score sur le winsorisé ---
-        d['_xw_'] = x_w
-        mu  = d.groupby(group_keys)['_xw_'].transform('mean')
-        sig = d.groupby(group_keys)['_xw_'].transform(lambda s: s.std(ddof=1))
-        
-        # si sigma = 0 -> NaN (on ne remplit pas par 0)
-        z   = (d['_xw_'] - mu) / sig.replace(0, np.nan)
-        
-        # pas de fillna(0.0) ici !
-        d[f'{col}{suffix}'] = z.clip(-clip_at, clip_at)
-        d.drop(columns=['_xw_'], inplace=True)
+    for sig in signal_cols:
+        if sig not in df_out.columns:
+            raise KeyError(f"Signal '{sig}' not in DataFrame")
 
-        # --- Clip final ---
-        zc = z.clip(-clip_at, clip_at)
-        out_col = f"{col}{suffix}"
-        d[out_col] = zc
-        new_cols.append(out_col)
+        # ---------- 1) CS winsor ----------
+        # per-group quantiles
+        ql = g[sig].transform(lambda s: s.quantile(q_low)  if s.notna().sum()>=min_group else np.nan)
+        qh = g[sig].transform(lambda s: s.quantile(q_high) if s.notna().sum()>=min_group else np.nan)
+        xw = df_out[sig].astype(float).clip(lower=ql, upper=qh)
+        df_out[f'{sig}__w'] = xw  # temp
 
-    return d, new_cols
+        new_cols = []
+
+        # build each hedge version
+        for mode in hedge_list:
+            if mode == 'none':
+                base = xw
+                tag  = 'BASE'
+            elif mode == 'market':
+                if not do_market:
+                    # skip if beta missing
+                    continue
+                resid = _cs_residualize(
+                    df_out.assign(_y_=xw),
+                    y_col='_y_',
+                    x_cols=[market_factor],
+                    group_keys=group_keys,
+                    min_cs=min_cs_resid
+                )
+                base = resid
+                tag  = 'HBETA'
+            elif mode == 'full':
+                xcols = [c for c in present_full]  # only those present
+                if not xcols:
+                    continue
+                resid = _cs_residualize(
+                    df_out.assign(_y_=xw),
+                    y_col='_y_',
+                    x_cols=xcols,
+                    group_keys=group_keys,
+                    min_cs=min_cs_resid
+                )
+                base = resid
+                tag  = 'HALL'
+            else:
+                continue
+
+            # ---------- 3) CS z-score on the (hedged) series ----------
+            df_out['_base_'] = base
+            mu  = df_out.groupby(group_keys)['_base_'].transform('mean')
+            sd  = df_out.groupby(group_keys)['_base_'].transform(lambda s: s.std(ddof=1))
+            z   = (df_out['_base_'] - mu) / sd.replace(0, np.nan)   # leave NaN if degenerate
+            # ---------- 4) clip ----------
+            zc  = z.clip(-clip_at, clip_at)
+
+            out_col = f'{sig}_{tag}_ZC{int(clip_at) if clip_at.is_integer() else clip_at}'
+            df_out[out_col] = zc
+            new_cols.append(out_col)
+
+            # clean temp
+            df_out.drop(columns=['_base_'], inplace=True)
+
+        # drop temp winsor
+        df_out.drop(columns=[f'{sig}__w'], inplace=True)
+        created[sig] = new_cols
+
+    return df_out, created
 
 
+SIGNALS = ['FEY','PEG_INV','SURPRISE_NTM']  # your signal columns
 
-def cs_rank_normal_clip(
-    df,
-    signal_cols,
-    *,
+df_proc, cols_made = make_signal_versions(
+    df_factors, SIGNALS,
     date_col='date',
-    by=None,             # ex: 'GICS_sector_name' pour within-sector
-    clip_at=3.5,
-    suffix='_rn',
-    min_group=8
-):
-    """
-    Pour chaque signal:
-      (1) rangs CS par groupe -> quantiles u = (rank-0.5)/n
-      (2) scores normaux z = Phi^{-1}(u)
-      (3) clip à [-clip_at, clip_at]
-    Retourne: (df_new, new_cols)
-    """
-    d = df.copy()
-    d = d.sort_values([date_col] + ([by] if by else []))
-    group_keys = [date_col] + ([by] if by else [])
-    g = d.groupby(group_keys, group_keys=False)
-
-    def _ranknorm(s: pd.Series):
-        z = pd.Series(index=s.index, dtype=float)
-        m = s.notna()
-        n = m.sum()
-        if n < min_group:
-            z[m] = 0.0
-            return z
-        ranks = s[m].rank(method='average')  # 1..n
-        u = (ranks - 0.5) / n                # (0,1)
-        z[m] = stats.norm.ppf(u.clip(1e-6, 1-1e-6))
-        z[~m] = np.nan
-        return z
-
-    new_cols = []
-    for col in signal_cols:
-        z = g[col].transform(_ranknorm)
-        zr = z.clip(-clip_at, clip_at)
-        out_col = f"{col}{suffix}"
-        d[out_col] = zr
-        new_cols.append(out_col)
-
-    return d, new_cols
-# z-score robuste aux outliers (winsor->z->clip) par (date, currency)
-df_z, z_cols = cs_winsor_zscore_clip(
-    df_factors, FACTS,
-    by='instrmtccy',        # ou ['instrmtccy','GICS_sector_name']
-    winsor_method='quantile', p_low=0.01, p_high=0.99, clip_at=3.0
+    by='instrmtccy',                 # or ['instrmtccy','GICS_sector_name'] if you prefer within-sector CS
+    q_low=0.01, q_high=0.99,
+    hedges=('none','market','full'),
+    market_factor='BETA',
+    full_factors=('BETA','SIZE','VALUE','VOL'),
+    clip_at=2.0,
+    min_group=8,
+    min_cs_resid=10
 )
 
-# rank->normal par (date, currency)
-df_rn, rn_cols = cs_rank_normal_clip(
-    df_factors, FACTS,
-    by='instrmtccy',        # ou ['instrmtccy','GICS_sector_name']
-    clip_at=3.5
-)
+print(cols_made)
+# {'FEY': ['FEY_BASE_ZC2', 'FEY_HBETA_ZC2', 'FEY_HALL_ZC2'], ...}
+
+
 
 
 # utiles.py
