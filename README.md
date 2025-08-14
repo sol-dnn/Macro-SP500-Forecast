@@ -52,14 +52,17 @@ def cs_winsor_zscore_clip(
             raise ValueError("winsor_method must be 'quantile' or 'iqr'")
 
         # --- Z-score CS ---
-        mu  = g.apply(lambda s: s[col].astype(float)).groupby(group_keys).transform('mean')
-        # mu calculé ci-dessus sur la série brute; on peut aussi utiliser x_w pour être 100% cohérent:
-        mu  = g[x_w.name].transform(lambda s: s.mean())
-        # std sur le winsorisé
-        sig = g[x_w.name].transform(lambda s: s.std(ddof=1))
-        # éviter division par 0
-        z = (x_w - mu) / sig.replace(0, np.nan)
-        z = z.fillna(0.0)  # si std=0 dans un groupe minuscule -> 0
+        # --- Z-score sur le winsorisé ---
+        d['_xw_'] = x_w
+        mu  = d.groupby(group_keys)['_xw_'].transform('mean')
+        sig = d.groupby(group_keys)['_xw_'].transform(lambda s: s.std(ddof=1))
+        
+        # si sigma = 0 -> NaN (on ne remplit pas par 0)
+        z   = (d['_xw_'] - mu) / sig.replace(0, np.nan)
+        
+        # pas de fillna(0.0) ici !
+        d[f'{col}{suffix}'] = z.clip(-clip_at, clip_at)
+        d.drop(columns=['_xw_'], inplace=True)
 
         # --- Clip final ---
         zc = z.clip(-clip_at, clip_at)
