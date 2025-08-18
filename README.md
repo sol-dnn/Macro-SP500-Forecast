@@ -1,4 +1,27 @@
-import numpy as np
+    d = d.sort_values([ccy_col, id_col, date_col])
+
+    # --- 1) currency-specific market return ---
+    parts = []
+    for ccy, sub in d.groupby(ccy_col, group_keys=False):
+        ret_wide = sub.pivot(index=date_col, columns=id_col, values=ret_col).fillna(0)
+        w_wide   = sub.pivot(index=date_col, columns=id_col, values=weight_col).fillna(0)
+
+        common = ret_wide.columns.intersection(w_wide.columns)
+        ret_wide = ret_wide[common]
+        w_wide   = w_wide[common].where(w_wide[common] > 0, 0)  # no negatives
+
+        row_sums = w_wide.sum(axis=1)
+        norm_w   = w_wide.div(row_sums.replace(0, np.nan), axis=0).fillna(0)
+
+        mkt_ser  = (norm_w * ret_wide).sum(axis=1).sort_index()   # currency market return
+        tmp = pd.DataFrame({date_col: mkt_ser.index, out_mkt: mkt_ser.values})
+        tmp[ccy_col] = ccy
+        parts.append(tmp)
+
+    mkt_df = pd.concat(parts, ignore_index=True)
+    d = d.merge(mkt_df, on=[date_col, ccy_col], how='left')
+    
+    import numpy as np
 import pandas as pd
 
 def _as_list(x):
