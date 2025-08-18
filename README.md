@@ -1,13 +1,78 @@
-def winsorize_group(s, q_low, q_high, min_group=5):
-    if s.notna().sum() < min_group:
-        return s * np.nan
-    low, high = s.quantile(q_low), s.quantile(q_high)
-    return s.clip(lower=low, upper=high)
+import numpy as np
+import pandas as pd
 
-df_out[f"{sig}_winsor"] = g[sig].transform(lambda s: winsorize_group(s, q_low, q_high, min_group))
+def cs_winsor_zclip(
+    df,
+    signal_cols,
+    *,
+    date_col='date',
+    by=None,                # e.g. 'instrmtccy' or ['instrmtccy','GICS_sector_name']
+    q_low=0.01, q_high=0.99,
+    clip_at=3.0,
+    min_group=8,
+    suffix='_BASE_ZC3'      # change to e.g. '_z' if you like
+):
+    """
+    For each signal:
+      1) cross-sectional winsorization within groups (date × by) at [q_low, q_high]
+      2) cross-sectional z-score on the winsorized values
+      3) final clip to [-clip_at, clip_at]
+    Returns (df_out, new_cols)
+    """
+    d = df.copy()
+    # normalize group keys
+    if by is None:
+        group_keys = [date_col]
+    elif isinstance(by, (list, tuple)):
+        group_keys = [date_col] + list(by)
+    else:
+        group_keys = [date_col] + [by]
+
+    g = d.groupby(group_keys, group_keys=False)
+    new_cols = []
+
+    def _winsorize_in_group(s: pd.Series, lo_q, hi_q, min_n):
+        s = s.astype(float)
+        if s.notna().sum() < min_n:
+            # too small cross-section -> return NaNs (will propagate)
+            return pd.Series(np.nan, index=s.index, dtype=float)
+        lo = s.quantile(lo_q)
+        hi = s.quantile(hi_q)
+        return s.clip(lower=lo, upper=hi)
+
+    for col in signal_cols:
+        if col not in d.columns:
+            raise KeyError(f"Signal '{col}' not found in DataFrame")
+
+        # 1) winsor (done inside each group to avoid any index misalignment)
+        xw = g[col].transform(lambda s: _winsorize_in_group(s, q_low, q_high, min_group))
+
+        # 2) z-score on winsorized values (per group)
+        d['_xw_'] = xw
+        mu = d.groupby(group_keys)['_xw_'].transform('mean')
+        sd = d.groupby(group_keys)['_xw_'].transform(lambda s: s.std(ddof=1))
+        z  = (d['_xw_'] - mu) / sd.replace(0, np.nan)   # if sd=NaN (small group), z stays NaN
+
+        # 3) clip
+        zc = z.clip(-clip_at, clip_at)
+
+        # output column
+        tag = int(clip_at) if float(clip_at).is_integer() else clip_at
+        out_col = f"{col}{suffix}"  # e.g. SURPRISE_BASE_ZC3
+        d[out_col] = zc
+        new_cols.append(out_col)
+
+        d.drop(columns=['_xw_'], inplace=True)
+
+    return d, new_cols
 
 
-
+df_simple, cols = cs_winsor_zclip(
+    df_factors, ['SURPRISE'],
+    date_col='date', by='instrmtccy',
+    q_low=0.01, q_high=0.99, clip_at=3.0,
+    min_group=8, suffix='_BASE_ZC3'
+)
 
 import numpy as np
 import pandas as pd
