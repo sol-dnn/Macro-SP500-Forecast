@@ -1,3 +1,24 @@
+df_daily[COL_DATE] = pd.to_datetime(df_daily[COL_DATE])
+g = df_daily.sort_values([COL_ID, COL_DATE]).groupby(
+        [COL_ID, df_daily[COL_DATE].dt.to_period('M')], as_index=False
+)
+
+def last_valid(s):
+    s = s.dropna()
+    return s.iloc[-1] if len(s) else np.nan
+
+px_eom = (
+    g.agg(
+        month_end   = (COL_DATE, 'max'),          # dernier jour de bourse observé
+        quoteclose  = (COL_PRICE, last_valid),    # dernière valeur non-nulle du mois
+        marketvalue = (COL_MKTCAP, last_valid)
+    )
+    .dropna(subset=['month_end'])                 # par sécurité
+    .sort_values([COL_ID, 'month_end'])
+    .reset_index(drop=True)
+)
+
+
 import pandas as pd
 import numpy as np
 
