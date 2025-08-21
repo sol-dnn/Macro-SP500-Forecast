@@ -1,23 +1,55 @@
+import pandas as pd
+import numpy as np
+
+# Assure les dtypes
 df_daily[COL_DATE] = pd.to_datetime(df_daily[COL_DATE])
-g = df_daily.sort_values([COL_ID, COL_DATE]).groupby(
-        [COL_ID, df_daily[COL_DATE].dt.to_period('M')], as_index=False
+df_daily[COL_BPS_RPT] = pd.to_datetime(df_daily[COL_BPS_RPT])
+
+# --- 1) calendrier de bourse par titre ---
+cal = (
+    df_daily[[COL_ID, COL_DATE]]
+    .drop_duplicates()
+    .sort_values([COL_ID, COL_DATE])
 )
 
-def last_valid(s):
-    s = s.dropna()
-    return s.iloc[-1] if len(s) else np.nan
+# --- 2) observations BPS par (titre, rpt_date) ---
+fundas_bps = (
+    df_daily[[COL_ID, COL_BPS, COL_BPS_RPT]]
+    .dropna(subset=[COL_BPS, COL_BPS_RPT])
+    .drop_duplicates(subset=[COL_ID, COL_BPS_RPT])
+    .rename(columns={COL_BPS: "bps_val", COL_BPS_RPT: "rpt_date_bps"})
+)
 
-px_eom = (
-    g.agg(
-        month_end   = (COL_DATE, 'max'),          # dernier jour de bourse observé
-        quoteclose  = (COL_PRICE, last_valid),    # dernière valeur non-nulle du mois
-        marketvalue = (COL_MKTCAP, last_valid)
+# --- 3) available_from = 1er jour de bourse STRICTEMENT après rpt_date ---
+parts = []
+for sid, g in fundas_bps.groupby(COL_ID, sort=False):
+    gg = g.sort_values("rpt_date_bps")
+    cg = cal.loc[cal[COL_ID]==sid, [COL_DATE]].sort_values(COL_DATE)
+    out = pd.merge_asof(
+        gg, cg,
+        left_on="rpt_date_bps",
+        right_on=COL_DATE,
+        direction="forward",
+        allow_exact_matches=False   # <-- STRICTEMENT après (post-close)
     )
-    .dropna(subset=['month_end'])                 # par sécurité
-    .sort_values([COL_ID, 'month_end'])
-    .reset_index(drop=True)
+    out = out.rename(columns={COL_DATE: "available_from"})
+    parts.append(out[[COL_ID, "rpt_date_bps", "bps_val", "available_from"]])
+available = pd.concat(parts, ignore_index=True).dropna(subset=["available_from"])
+
+# --- 4) EOM par titre ---
+eom = (
+    df_daily
+    .groupby([COL_ID, pd.Grouper(key=COL_DATE, freq="ME")], as_index=False)
+    .agg(month_end=(COL_DATE, "max"))
+    .sort_values([COL_ID, "month_end"])
 )
 
+# --- 5) BPS as-of EOM (dernière valeur avec available_from ≤ month_end) ---
+bps_asof = pd.merge_asof(
+    eom, available.sort_values([COL_ID, "available_from"]),
+    left_on="month_end", right_on="available_from",
+    by=COL_ID, direction="backward"
+)[[COL_ID, "month_end", "bps_val"]]
 
 import pandas as pd
 import numpy as np
