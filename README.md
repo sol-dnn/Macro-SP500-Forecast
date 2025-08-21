@@ -1,55 +1,45 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# Assure les dtypes
-df_daily[COL_DATE] = pd.to_datetime(df_daily[COL_DATE])
-df_daily[COL_BPS_RPT] = pd.to_datetime(df_daily[COL_BPS_RPT])
+# Entrées que tu as déjà :
+# px_eom: [sedolcd, month_end, quoteclose, marketvalue]
+# available: [sedolcd, available_from, bps_val]  (triable)
+COL_ID = "sedolcd"
 
-# --- 1) calendrier de bourse par titre ---
-cal = (
-    df_daily[[COL_ID, COL_DATE]]
-    .drop_duplicates()
-    .sort_values([COL_ID, COL_DATE])
+def asof_right_by_id(left_df, right_df, left_on, right_on, by, value_cols):
+    out = []
+    for sid, left_g in left_df.groupby(by, sort=False):
+        right_g = right_df[right_df[by]==sid].sort_values(right_on)
+        if right_g.empty:
+            continue
+        left_g  = left_g.sort_values(left_on)
+        rvals = right_g[right_on].values
+        idx = np.searchsorted(rvals, left_g[left_on].values, side="right") - 1  # dernier <=
+        m = idx >= 0
+        tmp = left_g.loc[m, [by, left_on]].copy()
+        for c in value_cols:
+            tmp[c] = right_g.iloc[idx[m]][c].values
+        out.append(tmp)
+    return pd.concat(out, ignore_index=True)
+
+bps_asof = asof_right_by_id(
+    left_df = px_eom[[COL_ID, "month_end"]],
+    right_df= available[[COL_ID, "available_from", "bps_val"]],
+    left_on = "month_end",
+    right_on= "available_from",
+    by      = COL_ID,
+    value_cols=["bps_val"]
 )
+# -> bps_asof: [sedolcd, month_end, bps_val_asof]
+bps_asof = bps_asof.rename(columns={"bps_val":"bps_val_asof"})
 
-# --- 2) observations BPS par (titre, rpt_date) ---
-fundas_bps = (
-    df_daily[[COL_ID, COL_BPS, COL_BPS_RPT]]
-    .dropna(subset=[COL_BPS, COL_BPS_RPT])
-    .drop_duplicates(subset=[COL_ID, COL_BPS_RPT])
-    .rename(columns={COL_BPS: "bps_val", COL_BPS_RPT: "rpt_date_bps"})
-)
+# Book-to-Market en EOM
+bm_eom = (px_eom
+          .merge(bps_asof, on=[COL_ID, "month_end"], how="left")
+          .assign(BM=lambda d: d["bps_val_asof"] / d["quoteclose"]))
 
-# --- 3) available_from = 1er jour de bourse STRICTEMENT après rpt_date ---
-parts = []
-for sid, g in fundas_bps.groupby(COL_ID, sort=False):
-    gg = g.sort_values("rpt_date_bps")
-    cg = cal.loc[cal[COL_ID]==sid, [COL_DATE]].sort_values(COL_DATE)
-    out = pd.merge_asof(
-        gg, cg,
-        left_on="rpt_date_bps",
-        right_on=COL_DATE,
-        direction="forward",
-        allow_exact_matches=False   # <-- STRICTEMENT après (post-close)
-    )
-    out = out.rename(columns={COL_DATE: "available_from"})
-    parts.append(out[[COL_ID, "rpt_date_bps", "bps_val", "available_from"]])
-available = pd.concat(parts, ignore_index=True).dropna(subset=["available_from"])
 
-# --- 4) EOM par titre ---
-eom = (
-    df_daily
-    .groupby([COL_ID, pd.Grouper(key=COL_DATE, freq="ME")], as_index=False)
-    .agg(month_end=(COL_DATE, "max"))
-    .sort_values([COL_ID, "month_end"])
-)
 
-# --- 5) BPS as-of EOM (dernière valeur avec available_from ≤ month_end) ---
-bps_asof = pd.merge_asof(
-    eom, available.sort_values([COL_ID, "available_from"]),
-    left_on="month_end", right_on="available_from",
-    by=COL_ID, direction="backward"
-)[[COL_ID, "month_end", "bps_val"]]
 
 import pandas as pd
 import numpy as np
