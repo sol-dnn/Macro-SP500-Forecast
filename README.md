@@ -1,45 +1,27 @@
-import numpy as np
-import pandas as pd
 
-# Entrées que tu as déjà :
-# px_eom: [sedolcd, month_end, quoteclose, marketvalue]
-# available: [sedolcd, available_from, bps_val]  (triable)
-COL_ID = "sedolcd"
+parts = []
+for sid, left_g in px_eom[[COL_ID, "month_end"]].groupby(COL_ID, sort=False):
+    # right = dates où la valeur BPS devient exploitable (déjà post-close)
+    right_g = (available[available[COL_ID] == sid]
+               .sort_values("available_from")[["available_from", "bps_val"]])
+    if right_g.empty:
+        continue
+    left_g = left_g.sort_values("month_end")
+    # dernier available_from <= month_end  --> as-of backward
+    tmp = pd.merge_asof(
+        left_g, right_g,
+        left_on="month_end",
+        right_on="available_from",
+        direction="backward",
+        allow_exact_matches=True
+    )
+    tmp[COL_ID] = sid
+    parts.append(tmp)
 
-def asof_right_by_id(left_df, right_df, left_on, right_on, by, value_cols):
-    out = []
-    for sid, left_g in left_df.groupby(by, sort=False):
-        right_g = right_df[right_df[by]==sid].sort_values(right_on)
-        if right_g.empty:
-            continue
-        left_g  = left_g.sort_values(left_on)
-        rvals = right_g[right_on].values
-        idx = np.searchsorted(rvals, left_g[left_on].values, side="right") - 1  # dernier <=
-        m = idx >= 0
-        tmp = left_g.loc[m, [by, left_on]].copy()
-        for c in value_cols:
-            tmp[c] = right_g.iloc[idx[m]][c].values
-        out.append(tmp)
-    return pd.concat(out, ignore_index=True)
-
-bps_asof = asof_right_by_id(
-    left_df = px_eom[[COL_ID, "month_end"]],
-    right_df= available[[COL_ID, "available_from", "bps_val"]],
-    left_on = "month_end",
-    right_on= "available_from",
-    by      = COL_ID,
-    value_cols=["bps_val"]
-)
-# -> bps_asof: [sedolcd, month_end, bps_val_asof]
-bps_asof = bps_asof.rename(columns={"bps_val":"bps_val_asof"})
-
-# Book-to-Market en EOM
-bm_eom = (px_eom
-          .merge(bps_asof, on=[COL_ID, "month_end"], how="left")
-          .assign(BM=lambda d: d["bps_val_asof"] / d["quoteclose"]))
-
-
-
+bps_asof = (pd.concat(parts, ignore_index=True)
+              .rename(columns={"bps_val": "bps_val_asof",
+                               "available_from": "available_from_asof"}))
+# bps_asof colonnes : sedolcd, month_end, bps_val_asof, available_from_asof
 
 import pandas as pd
 import numpy as np
