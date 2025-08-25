@@ -365,70 +365,82 @@ signals_monthly = (signals[[COL_ID,"month_end",
 
 # ---- OUTPUT ----
 # signals_monthly: one row per (sedolcd, month_end) with 6 signal columns (NaN if no active event)
-
  
-
-
-
-
-
-
-
-
-
 
  
  
 # ========= 7) SIGNAUX MENSUELS (H = 30/60/90) =========
-# rank au month_end
-me_rank = df_daily[[COL_ID, COL_DATE, "td_rank"]].merge(
-    eom.rename(columns={"month_end": COL_DATE}), on=[COL_ID, COL_DATE], how="right"
-).rename(columns={COL_DATE: "month_end", "td_rank": "rank_V"})
+import numpy as np
+import pandas as pd
 
-# dernier évènement avec ready_day <= V (asof)
-evt_ready = events.dropna(subset=["ready_day"])[[COL_ID, "ready_day", "EAR", "CFE"]].copy()
-sig = pd.merge_asof(
-    me_rank.sort_values([COL_ID, "month_end"]),
-    evt_ready.sort_values([COL_ID, "ready_day"]),
-    left_on="month_end",
-    right_on="ready_day",
-    by=COL_ID,
-    direction="backward",
-)
-
-# âge en jours de bourse = rank_V - rank(ready_day)
-rdy_rank = rank_map.rename(columns={"d": "ready_day", "td_rank": "ready_rank"})
-sig = sig.merge(rdy_rank, on=[COL_ID, "ready_day"], how="left")
-sig["age_bdays"] = sig["rank_V"] - sig["ready_rank"]
-
-def carry(x, H):
-    return np.where((x["age_bdays"] >= 0) & (x["age_bdays"] < H), x, np.nan)
-
-tmp = sig.copy()
-ear30 = carry(tmp[["EAR","age_bdays"]].copy(), 30)["EAR"]
-ear60 = carry(tmp[["EAR","age_bdays"]].copy(), 60)["EAR"]
-ear90 = carry(tmp[["EAR","age_bdays"]].copy(), 90)["EAR"]
-cfe30 = carry(tmp[["CFE","age_bdays"]].copy(), 30)["CFE"]
-cfe60 = carry(tmp[["CFE","age_bdays"]].copy(), 60)["CFE"]
-cfe90 = carry(tmp[["CFE","age_bdays"]].copy(), 90)["CFE"]
-
-signals_monthly = (
-    sig[[COL_ID, "month_end"]]
-    .assign(
-        sig_EAR_30 = ear30,
-        sig_EAR_60 = ear60,
-        sig_EAR_90 = ear90,
-        sig_CFE_30 = cfe30,
-        sig_CFE_60 = cfe60,
-        sig_CFE_90 = cfe90,
+# --- 1) month-end trading-day rank per stock (rank_V) ---
+rank_V = (
+    px_eom[[COL_ID, "month_end"]]
+    .merge(
+        df_daily[[COL_ID, COL_DATE, "td_rank"]]
+            .rename(columns={COL_DATE: "month_end"}),
+        on=[COL_ID, "month_end"],
+        how="left",
+        validate="m:1",
     )
-    .sort_values([ "month_end", COL_ID ])
+    .rename(columns={"td_rank": "rank_V"})
+    .sort_values([COL_ID, "month_end"])
     .reset_index(drop=True)
 )
 
-# ========= SORTIE =========
-# signals_monthly: (month_end, sedolcd) + 6 colonnes de signaux
-# Tu peux merger sur ton panel mensuel existant via (sedolcd, month_end).
+# --- 2) ensure events have ready_rank (map date -> rank) ---
+evt_ready = (
+    events_final.dropna(subset=["ready_day"])[[COL_ID, "ready_day", "EAR", "CFE"]]
+    .merge(
+        df_daily[[COL_ID, COL_DATE, "td_rank"]].rename(columns={COL_DATE: "ready_day"}),
+        on=[COL_ID, "ready_day"],
+        how="left",
+        validate="m:1",
+    )
+    .rename(columns={"td_rank": "ready_rank"})
+    .sort_values([COL_ID, "ready_rank"])
+    .reset_index(drop=True)
+)
+
+# --- 3) function: last event active at V with age < H (trading days) ---
+def carry_signal(rankV_df, evt_df, val_col, H):
+    out = []
+    for sid, gv in rankV_df.groupby(COL_ID, sort=False):
+        rv = gv["rank_V"].to_numpy()
+        e  = evt_df[evt_df[COL_ID] == sid]
+        rr = e["ready_rank"].to_numpy()
+        vv = e[val_col].to_numpy()
+        if rr.size == 0:
+            tmp = gv[[COL_ID, "month_end"]].copy()
+            tmp[f"sig_{val_col}_{H}"] = np.nan
+            out.append(tmp); continue
+        # index of most-recent ready_rank <= rank_V
+        idx = np.searchsorted(rr, rv, side="right") - 1
+        m = idx >= 0
+        age = np.full(rv.shape, np.inf)
+        age[m] = rv[m] - rr[idx[m]]
+        sig = np.full(rv.shape, np.nan, dtype=float)
+        sel = m & (age < H)
+        sig[sel] = vv[idx[sel]]
+        tmp = gv[[COL_ID, "month_end"]].copy()
+        tmp[f"sig_{val_col}_{H}"] = sig
+        out.append(tmp)
+    return pd.concat(out, ignore_index=True)
+
+# --- 4) build all signals (H = 30, 60, 90) ---
+signals = rank_V[[COL_ID, "month_end"]].copy()
+for H in (30, 60, 90):
+    signals = signals.merge(carry_signal(rank_V, evt_ready, "EAR", H),
+                            on=[COL_ID, "month_end"], how="left")
+    signals = signals.merge(carry_signal(rank_V, evt_ready, "CFE", H),
+                            on=[COL_ID, "month_end"], how="left")
+
+# --- 5) final monthly panel (ready to merge with your monthly dataset) ---
+signals_monthly = (signals
+                   .sort_values(["month_end", COL_ID])
+                   .reset_index(drop=True))
+# columns: [sedolcd, month_end, sig_EAR_30, sig_EAR_60, sig_EAR_90, sig_CFE_30, sig_CFE_60, sig_CFE_90]
+
 
 
 # S&P 500 Forecasting Using Macro-Financial Variables
