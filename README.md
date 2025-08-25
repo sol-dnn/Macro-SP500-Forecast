@@ -224,46 +224,105 @@ df_daily["ret_peer_bench"] = np.where(
 )
 
 # ---------- 6) EVENTS → EAR & CFE (tradable J+2) ----------
-# J = next trading day strictly after EPS rpt_date
-events_raw = (df[[COL_ID, COL_EPS_RPT]].dropna()
-              .drop_duplicates(subset=[COL_ID, COL_EPS_RPT])
-              .rename(columns={COL_EPS_RPT:"rpt_date"}))
-events = map_next_trading_day(events_raw, strict_after=True).rename(columns={"available_from":"J"})
+import numpy as np
+import pandas as pd
 
-# get needed daily fields around J: ret_d, ret_peer_bench, price, ibes_mean
-for c in ["ret_d", "ret_peer_bench", COL_PRICE, COL_IBES_MEAN]:
-    df[f"{c}_lag1"]  = df.groupby(COL_ID)[c].shift(1)
-    df[f"{c}_lead1"] = df.groupby(COL_ID)[c].shift(-1)
+# ==== 1) Préparations (tri, ranks, IBES as-of) ====
+df_daily = df_daily.sort_values([COL_ID, COL_DATE]).copy()
 
-evt_join = df.rename(columns={COL_DATE:"J"})[[COL_ID,"J",
-    "ret_d_lag1","ret_d","ret_d_lead1",
-    "ret_peer_bench_lag1","ret_peer_bench","ret_peer_bench_lead1",
-    f"{COL_PRICE}_lag1", f"{COL_IBES_MEAN}_lag1"
-]]
+# rang de jour de bourse par titre (servira pour J+2)
+if "td_rank" not in df_daily.columns:
+    df_daily["td_rank"] = df_daily.groupby(COL_ID).cumcount()
 
-# attach EPS actual at J
-eps_at_J = df.rename(columns={COL_DATE:"J"})[[COL_ID,"J", COL_EPS_ACT]]
+# consensus IBES as-of : dernière valeur connue à chaque date
+df_daily["ibes_ffill"] = (
+    df_daily.groupby(COL_ID)[COL_IBES_MEAN]
+            .ffill()      # dernière valeur disponible antérieure (≤ t)
+)
 
-events = (events.merge(evt_join, on=[COL_ID,"J"], how="left")
-                .merge(eps_at_J, on=[COL_ID,"J"], how="left"))
+# ==== 2) Fonction: mappe rpt_date -> J (1er jour de bourse strictement après) ====
+def map_next_trading_day(events_df, strict_after=True):
+    side = "right" if strict_after else "left"
+    out = []
+    for sid, ev in events_df.groupby(COL_ID, sort=False):
+        g   = ev.sort_values("rpt_date").copy()
+        cal = df_daily.loc[df_daily[COL_ID]==sid, [COL_DATE, "td_rank"]]
+        if cal.empty:
+            continue
+        dates = cal[COL_DATE].values
+        ranks = cal["td_rank"].values
+        idx   = np.searchsorted(dates, g["rpt_date"].values, side=side)
+        ok    = idx < len(dates)
+        gg    = g.loc[ok].copy()
+        gg["J"]       = pd.to_datetime(dates[idx[ok]])
+        gg["J_rank"]  = ranks[idx[ok]]
+        out.append(gg)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=[COL_ID,"rpt_date","J","J_rank"])
 
-# EAR (arith. products)
-R3 = (1+events["ret_d_lag1"]) * (1+events["ret_d"]) * (1+events["ret_d_lead1"])
-B3 = (1+events["ret_peer_bench_lag1"]) * (1+events["ret_peer_bench"]) * (1+events["ret_peer_bench_lead1"])
-events["EAR"] = R3 - B3
+# évènements résultats (une ligne par (id, rpt_date))
+events_raw = (
+    df_daily[[COL_ID, COL_EPS_RPT, COL_EPS_ACT]]
+    .dropna(subset=[COL_EPS_RPT])
+    .drop_duplicates(subset=[COL_ID, COL_EPS_RPT])
+    .rename(columns={COL_EPS_RPT: "rpt_date"})
+)
+events_raw["rpt_date"] = pd.to_datetime(events_raw["rpt_date"])
 
-# CFE (price-scaled), consensus as-of J-1
-events["price_Jm1"] = events[f"{COL_PRICE}_lag1"]
-events["ibes_mean_Jm1"] = events[f"{COL_IBES_MEAN}_lag1"]
-events["CFE"] = (events[COL_EPS_ACT] - events["ibes_mean_Jm1"]) / events["price_Jm1"]
+# J = prochain jour de bourse STRICTEMENT après rpt_date (post-close conservateur)
+events = map_next_trading_day(events_raw, strict_after=True)
 
-# ready_day = J+2 trading days
-rank_map = df[[COL_ID, COL_DATE, "td_rank"]].rename(columns={COL_DATE:"d"})
-events = events.merge(rank_map.rename(columns={"d":"J"}), on=[COL_ID,"J"], how="left")
-events["ready_rank"] = events["td_rank"] + 2
-events = events.merge(rank_map.rename(columns={"d":"ready_day"}),
-                      left_on=[COL_ID,"ready_rank"], right_on=[COL_ID,"td_rank"], how="left")
-events = events.rename(columns={"ready_day":"ready_day"}).drop(columns=["td_rank_x","td_rank_y"])
+# rattache l’EPS annoncé observé à J (si besoin)
+events = events.merge(
+    df_daily[[COL_ID, COL_DATE, COL_EPS_ACT]].rename(columns={COL_DATE:"J"}),
+    on=[COL_ID, "J"], how="left"
+)
+
+# ==== 3) Récupère retours du titre et des pairs à J-1, J, J+1 ====
+# on prépare les lags/leads une seule fois
+for c in ["ret_d", "ret_peer_bench", COL_PRICE, "ibes_ffill"]:
+    df_daily[f"{c}_lag1"]  = df_daily.groupby(COL_ID)[c].shift(1)
+    df_daily[f"{c}_lead1"] = df_daily.groupby(COL_ID)[c].shift(-1)
+
+evt_join = (
+    df_daily.rename(columns={COL_DATE:"J"})[[COL_ID,"J",
+        "ret_d_lag1","ret_d","ret_d_lead1",
+        "ret_peer_bench_lag1","ret_peer_bench","ret_peer_bench_lead1",
+        f"{COL_PRICE}_lag1", "ibes_ffill_lag1",
+        "td_rank"  # rang du jour J (utile pour ready_day)
+    ]]
+    .rename(columns={"td_rank":"J_rank_chk"})
+)
+
+events = events.merge(evt_join, on=[COL_ID,"J"], how="left")
+
+# ==== 4) EAR (produit arithmétique) ====
+# garde uniquement les annonces où on a bien les 3 jours pour titre ET peers
+mask_ok = (
+    events[["ret_d_lag1","ret_d","ret_d_lead1",
+            "ret_peer_bench_lag1","ret_peer_bench","ret_peer_bench_lead1"]]
+    .notna().all(axis=1)
+)
+ev_ok = events.loc[mask_ok].copy()
+
+R3 = (1 + ev_ok["ret_d_lag1"]) * (1 + ev_ok["ret_d"]) * (1 + ev_ok["ret_d_lead1"])
+B3 = (1 + ev_ok["ret_peer_bench_lag1"]) * (1 + ev_ok["ret_peer_bench"]) * (1 + ev_ok["ret_peer_bench_lead1"])
+ev_ok["EAR"] = R3 - B3
+
+# ==== 5) CFE (consensus error, as-of J-1, scalarisé par le prix J-1) ====
+ev_ok["price_Jm1"]     = ev_ok[f"{COL_PRICE}_lag1"]
+ev_ok["ibes_mean_Jm1"] = ev_ok["ibes_ffill_lag1"]      # dernier consensus ≤ J-1
+ev_ok["CFE"] = (ev_ok[COL_EPS_ACT] - ev_ok["ibes_mean_Jm1"]) / ev_ok["price_Jm1"]
+
+# ==== 6) ready_day = J + 2 jours de bourse (tradable date) ====
+ev_ok["ready_rank"] = ev_ok["J_rank"] + 2   # J_rank vient de map_next_trading_day
+
+# map rank -> date via df_daily
+rank_map = df_daily[[COL_ID, COL_DATE, "td_rank"]].rename(columns={COL_DATE:"ready_day"})
+ev_ok = ev_ok.merge(rank_map, left_on=[COL_ID,"ready_rank"], right_on=[COL_ID,"td_rank"], how="left") \
+             .drop(columns=["td_rank"])
+
+# ==== 7) Résultat final des évènements ====
+events_final = ev_ok[[COL_ID, "rpt_date", "J", "ready_day", "EAR", "CFE"]].sort_values(["J", COL_ID]).reset_index(drop=True)
 
 # ---------- 7) MONTHLY SIGNALS (carry H=30/60/90, no decay) ----------
 # trading-day rank at month_end
@@ -312,194 +371,19 @@ signals_monthly = (signals[[COL_ID,"month_end",
 # ---- OUTPUT ----
 # signals_monthly: one row per (sedolcd, month_end) with 6 signal columns (NaN if no active event)
 
+ 
 
-import pandas as pd
-import numpy as np
 
-# ========= CONFIG COLS (modifie ici si tes noms diffèrent) =========
-COL_DATE      = "date"
-COL_ID        = "sedolcd"
-COL_CCY       = "instrmtccy"
-COL_PRICE     = "quoteclose"
-COL_MKTCAP    = "marketvalue"
-COL_TR        = "totalreturn"      # daily TR (simple return, ex: 0.004). Fallbacks en dessous.
-COL_PR_RET    = "closereturn"      # fallback si totalreturn indisponible (simple return)
-COL_BPS       = "wsf_bps_ltm"      # sinon wsf_bps_qtr
-COL_BPS_RPT   = "wsf_bps_rpt_date_qtr"  # si absent, fallback -> wsf_eps_rpt_date_qtr
-COL_EPS_RPT   = "wsf_eps_rpt_date_qtr"
-COL_EPS_ACT   = "wsf_eps_qtr"      # EPS annoncé à la rpt date
-COL_IBES_MEAN = "ibes_eps_mean_qtr"
 
-# ========= INPUT =========
-# df_daily: DataFrame quotidien avec au moins les colonnes ci-dessus
-# (Si ton DF est déjà chargé sous un autre nom, renomme pour suivre)
-df_daily = df_daily.copy()
 
-# ========= 0) FILTER USD =========
-df_daily[COL_DATE] = pd.to_datetime(df_daily[COL_DATE])
-df_daily = df_daily[df_daily[COL_CCY] == "USD"].copy()
-df_daily.sort_values([COL_ID, COL_DATE], inplace=True)
 
-# ========= 1) RETOURS QUOTIDIENS =========
-# On crée ret_d: priorité à 'totalreturn', sinon 'closereturn', sinon %chg du prix.
-if COL_TR in df_daily.columns and df_daily[COL_TR].notna().any():
-    df_daily["ret_d"] = df_daily[COL_TR]
-elif COL_PR_RET in df_daily.columns and df_daily[COL_PR_RET].notna().any():
-    df_daily["ret_d"] = df_daily[COL_PR_RET]
-else:
-    df_daily["ret_d"] = df_daily.groupby(COL_ID)[COL_PRICE].pct_change()
 
-# ========= 2) CALENDRIER MENSUEL (EOM par titre) =========
-eom = (
-    df_daily[[COL_ID, COL_DATE]]
-    .groupby([COL_ID, pd.Grouper(key=COL_DATE, freq="M")])  # M = month-end calendar
-    .max()
-    .rename(columns={COL_DATE: "month_end"})
-    .reset_index()
-)
-# Price & mktcap EOM
-px_eom = df_daily[[COL_ID, COL_DATE, COL_PRICE, COL_MKTCAP]].merge(
-    eom, left_on=[COL_ID, COL_DATE], right_on=[COL_ID, "month_end"], how="right"
-)
-px_eom = px_eom[[COL_ID, "month_end", COL_PRICE, COL_MKTCAP]]
 
-# ========= 3) "available_from" pour BPS (as-of merge) =========
-# Fallbacks colonnes BPS / RPT si manquantes
-if COL_BPS not in df_daily.columns:
-    COL_BPS = "wsf_bps_qtr"
-if COL_BPS_RPT not in df_daily.columns or COL_BPS_RPT not in df_daily.columns:
-    if COL_EPS_RPT in df_daily.columns:
-        COL_BPS_RPT = COL_EPS_RPT
-    else:
-        raise ValueError("Aucune colonne de rpt_date pour BPS trouvée.")
 
-fundas_bps = (
-    df_daily[[COL_ID, COL_DATE, COL_BPS, COL_BPS_RPT]]
-    .dropna(subset=[COL_BPS, COL_BPS_RPT])
-    .rename(columns={COL_BPS_RPT: "rpt_date_bps", COL_BPS: "bps_val"})
-    .copy()
-)
-fundas_bps["rpt_date_bps"] = pd.to_datetime(fundas_bps["rpt_date_bps"])
-# available_from = prochain jour de bourse >= rpt_date_bps (asof forward sur calendrier du titre)
-# On fait un merge_asof forward avec le calendrier des dates négociées par titre
-cal = df_daily[[COL_ID, COL_DATE]].drop_duplicates().copy()
-fundas_bps = fundas_bps.merge(cal, on=COL_ID, how="left")
-fundas_bps = (
-    pd.merge_asof(
-        fundas_bps.sort_values([COL_ID, "rpt_date_bps"]),
-        cal.sort_values([COL_ID, COL_DATE]),
-        left_on="rpt_date_bps",
-        right_on=COL_DATE,
-        by=COL_ID,
-        direction="forward",
-        allow_exact_matches=True,
-    )
-    .rename(columns={COL_DATE: "available_from"})
-    [[COL_ID, "available_from", "bps_val"]]
-    .dropna(subset=["available_from"])
-)
-# BPS as-of à EOM
-bps_asof = (
-    pd.merge_asof(
-        eom.sort_values([COL_ID, "month_end"]),
-        fundas_bps.sort_values([COL_ID, "available_from"]),
-        left_on="month_end",
-        right_on="available_from",
-        by=COL_ID,
-        direction="backward",
-    )
-    [[COL_ID, "month_end", "bps_val"]]
-)
-# BM EOM
-bm_eom = bps_asof.merge(px_eom, on=[COL_ID, "month_end"], how="left")
-bm_eom["BM"] = bm_eom["bps_val"] / bm_eom[COL_PRICE]
 
-# ========= 4) Buckets size×BM (5×5) au mois M, cellule utilisée le mois suivant =========
-bm_eom["size_q"] = (
-    bm_eom.groupby("month_end")[COL_MKTCAP]
-    .transform(lambda s: pd.qcut(np.log(s.replace(0, np.nan)), 5, labels=False, duplicates="drop"))
-)
-bm_eom["bm_q"] = (
-    bm_eom.groupby("month_end")["BM"]
-    .transform(lambda s: pd.qcut(s.replace([np.inf, -np.inf], np.nan), 5, labels=False, duplicates="drop"))
-)
-bm_eom["cell"] = bm_eom["size_q"].astype("Int64").astype(str) + "_" + bm_eom["bm_q"].astype("Int64").astype(str)
 
-# Map cellule du mois M -> pour les jours du mois (M+1)
-# Pour chaque jour, on veut la cellule du EOM précédent
-df_daily["prev_eom"] = (df_daily[COL_DATE].dt.to_period("M") - 1).dt.to_timestamp("M")
-cell_map = bm_eom[[COL_ID, "month_end", "cell"]].rename(columns={"month_end": "prev_eom"})
-df_daily = df_daily.merge(cell_map, on=[COL_ID, "prev_eom"], how="left")
-
-# ========= 5) ret_peer_d (EW par cellule, incluant le titre) =========
-peer = (
-    df_daily[[COL_DATE, "cell", "ret_d"]]
-    .dropna(subset=["cell"])
-    .groupby([COL_DATE, "cell"], observed=True)["ret_d"]
-    .mean()
-    .rename("ret_peer_d")
-    .reset_index()
-)
-df_daily = df_daily.merge(peer, on=[COL_DATE, "cell"], how="left")
-
-# ========= 6) ÉVÉNEMENTS: J (rpt) -> EAR et CFE =========
-events = (
-    df_daily[[COL_ID, COL_EPS_RPT, COL_EPS_ACT]]
-    .dropna(subset=[COL_EPS_RPT])
-    .drop_duplicates(subset=[COL_ID, COL_EPS_RPT])
-    .rename(columns={COL_EPS_RPT: "rpt_date"})
-)
-events["rpt_date"] = pd.to_datetime(events["rpt_date"])
-
-# J = prochain jour de bourse >= rpt_date (par titre)
-events = events.merge(cal, on=COL_ID, how="left")
-events = pd.merge_asof(
-    events.sort_values([COL_ID, "rpt_date"]),
-    cal.sort_values([COL_ID, COL_DATE]),
-    left_on="rpt_date",
-    right_on=COL_DATE,
-    by=COL_ID,
-    direction="forward",
-    allow_exact_matches=True,
-).rename(columns={COL_DATE: "J"})[[COL_ID, "J"]].dropna()
-
-# Ajoute EPS annoncé à J
-eps_at_J = df_daily[[COL_ID, COL_DATE, COL_EPS_ACT]].rename(columns={COL_DATE: "J"})
-events = events.merge(eps_at_J, on=[COL_ID, "J"], how="left")
-
-# Retours titre & pairs aux jours J-1,J,J+1
-for c in ["ret_d", "ret_peer_d", COL_PRICE, COL_IBES_MEAN]:
-    df_daily[f"{c}_lead1"] = df_daily.groupby(COL_ID)[c].shift(-1)
-    df_daily[f"{c}_lag1"]  = df_daily.groupby(COL_ID)[c].shift(1)
-
-evt_join = df_daily[[COL_ID, COL_DATE,
-                     "ret_d_lag1","ret_d","ret_d_lead1",
-                     "ret_peer_d_lag1","ret_peer_d","ret_peer_d_lead1",
-                     f"{COL_PRICE}_lag1", f"{COL_IBES_MEAN}_lag1"
-                    ]].rename(columns={COL_DATE: "J"})
-
-events = events.merge(evt_join, on=[COL_ID, "J"], how="left")
-
-# EAR (produit arithmétique vs pairs)
-R3  = (1+events["ret_d_lag1"]) * (1+events["ret_d"]) * (1+events["ret_d_lead1"])
-B3  = (1+events["ret_peer_d_lag1"]) * (1+events["ret_peer_d"]) * (1+events["ret_peer_d_lead1"])
-events["EAR"] = R3 - B3
-
-# CFE as-of J-1 (price-scaled)
-events["price_Jm1"] = events[f"{COL_PRICE}_lag1"]
-events["ibes_mean_Jm1"] = events[f"{COL_IBES_MEAN}_lag1"]
-events["CFE"] = (events[COL_EPS_ACT] - events["ibes_mean_Jm1"]) / events["price_Jm1"]
-
-# ready_day = J+2 jours de bourse
-# On numérote les jours par titre pour calculer "J+2"
-df_daily["td_rank"] = df_daily.groupby(COL_ID).cumcount()
-rank_map = df_daily[[COL_ID, COL_DATE, "td_rank"]].rename(columns={COL_DATE: "d"})
-events = events.merge(rank_map.rename(columns={"d": "J"}), on=[COL_ID, "J"], how="left")
-events["ready_rank"] = events["td_rank"] + 2
-ready_map = rank_map.rename(columns={"d": "ready_day"})
-events = events.merge(ready_map, left_on=[COL_ID, "ready_rank"], right_on=[COL_ID, "td_rank"], how="left")
-events = events.rename(columns={"ready_day": "ready_day"}).drop(columns=["td_rank_x","td_rank_y"])
-
+ 
+ 
 # ========= 7) SIGNAUX MENSUELS (H = 30/60/90) =========
 # rank au month_end
 me_rank = df_daily[[COL_ID, COL_DATE, "td_rank"]].merge(
