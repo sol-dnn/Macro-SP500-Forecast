@@ -166,46 +166,99 @@ df = df.merge(cell_map, on=[COL_ID, "prev_eom"], how="left", validate="m:1")
 # Cell peers (members-only)
 mask_cell = df["is_member_prev"].fillna(False) & df["cell"].notna()
 
-# Light trimming 1%-99% within (date, cell) among members
-dfm = df.loc[mask_cell, [COL_DATE, "cell", "ret_d"]].copy()
+import numpy as np
+import pandas as pd
+
+MIN_CELL = 20          # seuil min d’effectif pour utiliser la cellule
+TRIM_LO, TRIM_HI = 0.01, 0.99
+
+# ---------- A) Map du mois précédent vers le daily (prev_eom) ----------
+# eom_map: (id, month_period) -> dernier JOUR DE BOURSE du mois
+eom_map = (
+    px_eom
+    .assign(month_period=px_eom["month_end"].dt.to_period("M"))
+    [[COL_ID, "month_period", "month_end"]]
+    .drop_duplicates([COL_ID, "month_period"])
+    .rename(columns={"month_end": "prev_eom"})
+)
+
+# ajoute period courant + précédent et map -> prev_eom par titre
+df_daily["month_period"] = df_daily[COL_DATE].dt.to_period("M")
+df_daily["prev_period"]  = df_daily["month_period"] - 1
+df_daily = df_daily.merge(
+    eom_map.rename(columns={"month_period":"prev_period"}),
+    on=[COL_ID, "prev_period"],
+    how="left",
+    validate="m:1"
+)
+
+# apporte la cellule (et size_q) définies à prev_eom (point-in-time MSCI au mois précédent)
+cell_map = bm_eom[[COL_ID, "month_end", "cell", "size_q", "is_member"]] \
+             .rename(columns={"month_end":"prev_eom", "is_member":"is_member_prev"})
+df_daily = df_daily.merge(cell_map, on=[COL_ID, "prev_eom"], how="left", validate="m:1")
+
+# ---------- B) PEERS par cellule (membres seulement), trimming léger, exclude self ----------
+mask_mem_cell = df_daily["is_member_prev"].fillna(False) & df_daily["cell"].notna()
+
+# on calcule les stats seulement sur les membres de la cellule
+dfm = df_daily.loc[mask_mem_cell, [COL_DATE, "cell", "ret_d"]].copy()
+
 grp = dfm.groupby([COL_DATE, "cell"], observed=True)
 q_lo = grp["ret_d"].transform(lambda s: s.quantile(TRIM_LO))
 q_hi = grp["ret_d"].transform(lambda s: s.quantile(TRIM_HI))
-dfm["in_band"] = dfm["ret_d"].between(q_lo, q_hi, inclusive="both")
+dfm["in_band"]  = dfm["ret_d"].between(q_lo, q_hi, inclusive="both")
 dfm["ret_trim"] = dfm["ret_d"].where(dfm["in_band"])
+
 grp2 = dfm.groupby([COL_DATE, "cell"], observed=True)
 dfm["mu_trim_inc"] = grp2["ret_trim"].transform("mean")
 dfm["n_trim"]      = grp2["ret_trim"].transform("count")
 
-# exclude self correctly (jackknife only if inside band)
+# exclude self correctement: jackknife seulement si le titre est DANS l’échantillon tronqué
 dfm["ret_peer_cell_trim_ex"] = np.where(
     dfm["in_band"] & (dfm["n_trim"] > 1),
     (dfm["n_trim"] * dfm["mu_trim_inc"] - dfm["ret_d"]) / (dfm["n_trim"] - 1),
     dfm["mu_trim_inc"]
 )
 
-# broadcast back to full daily
-df = df.merge(dfm[[COL_DATE, "cell", "ret_peer_cell_trim_ex", "n_trim"]],
-              on=[COL_DATE, "cell"], how="left").rename(columns={"n_trim":"n_cell_trim"})
+# on réinjecte ces colonnes dans le daily
+df_daily = df_daily.merge(
+    dfm[[COL_DATE, "cell", "ret_peer_cell_trim_ex", "n_trim"]],
+    on=[COL_DATE, "cell"],
+    how="left"
+).rename(columns={"n_trim":"n_cell_trim"})
 
-# Size-only peers (members-only), exclude self
-grp_size = df[df["is_member_prev"].fillna(False) & df["size_q"].notna()] \
-            .groupby([COL_DATE, "size_q"], observed=True)
-peer_size = (grp_size["ret_d"].agg(mean="mean", n="size").reset_index()
-             .rename(columns={"mean":"mu_size", "n":"n_size"}))
-df = df.merge(peer_size, on=[COL_DATE, "size_q"], how="left")
-df["ret_peer_size_ex"] = np.where(
-    df["is_member_prev"].fillna(False) & (df["n_size"] > 1),
-    (df["n_size"] * df["mu_size"] - df["ret_d"]) / (df["n_size"] - 1),
-    df["mu_size"]
+# ---------- C) Fallback Size-only (membres seulement), exclude self ----------
+mask_mem_size = df_daily["is_member_prev"].fillna(False) & df_daily["size_q"].notna()
+
+peer_size = (
+    df_daily.loc[mask_mem_size, [COL_DATE, "size_q", "ret_d"]]
+            .groupby([COL_DATE, "size_q"], observed=True)["ret_d"]
+            .agg(mean="mean", n="size")
+            .reset_index()
+            .rename(columns={"mean":"mu_size", "n":"n_size"})
 )
 
-# Benchmark with min-peer fallback
-df["ret_peer_bench"] = np.where(
-    df["n_cell_trim"].fillna(0) >= MIN_CELL,
-    df["ret_peer_cell_trim_ex"],
-    df["ret_peer_size_ex"]
+df_daily = df_daily.merge(peer_size, on=[COL_DATE, "size_q"], how="left")
+
+# jackknife exclude self pour le fallback
+df_daily["ret_peer_size_ex"] = np.where(
+    mask_mem_size & (df_daily["n_size"] > 1),
+    (df_daily["n_size"] * df_daily["mu_size"] - df_daily["ret_d"]) / (df_daily["n_size"] - 1),
+    df_daily["mu_size"]
 )
+
+# ---------- D) Benchmark final: cellule si assez grande, sinon size-only ----------
+df_daily["ret_peer_bench"] = np.where(
+    df_daily["n_cell_trim"].fillna(0) >= MIN_CELL,
+    df_daily["ret_peer_cell_trim_ex"],      # même cellule, trimmed, exclude self
+    df_daily["ret_peer_size_ex"]            # fallback taille, exclude self
+)
+
+# (facultatif) quelques colonnes utiles pour debug / QA
+# cols_debug = ["sedolcd","date","prev_eom","cell","size_q","is_member_prev",
+#               "n_cell_trim","ret_peer_cell_trim_ex","n_size","ret_peer_size_ex","ret_peer_bench"]
+# display(df_daily[cols_debug].head(20))
+
 
 # ---------- 6) EVENTS → EAR & CFE (tradable J+2) ----------
 # J = next trading day strictly after EPS rpt_date
