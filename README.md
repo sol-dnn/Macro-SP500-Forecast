@@ -443,6 +443,253 @@ signals_monthly = (signals
 
 
 
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+
+# ========= PARAMS =========
+ID, DATE = COL_ID, COL_DATE              # tes constantes
+D_MAX     = 90                           # horizon max pour la courbe de drift (jours de bourse)
+TRAIN_END = pd.Timestamp("2018-12-31")   # fin de fenêtre d'apprentissage (à adapter)
+CALIB_METHOD = "reg"                     # "reg" ou "quintile"
+NBINS_EAR    = 5                         # nb de bins si method = "quintile"
+IMPOSE_MONOTONE = True                   # cummax sur beta(d) (optionnel, méthode "reg")
+
+# ========= 0) Abnormal daily =========
+df = (df_daily
+      .sort_values([ID, DATE])
+      .copy())
+df["abn_d"] = df["ret_d"] - df["ret_peer_bench"]   # r - benchmark peers
+
+# calendrier / cumsum rapide par titre
+cal = (df[[ID, DATE, "td_rank", "abn_d"]]
+       .drop_duplicates()
+       .sort_values([ID, DATE])
+       .reset_index(drop=True))
+
+csum_dict = {}
+for sid, g in cal.groupby(ID, sort=False):
+    ranks = g["td_rank"].to_numpy()
+    abn   = g["abn_d"].to_numpy()
+    csum  = np.concatenate(([0.0], np.cumsum(abn)))  # csum[k] = sum abn[0..k-1]
+    csum_dict[sid] = (ranks, csum)
+
+# ========= 1) Evénements d'apprentissage =========
+train_evt = (events_final
+             .dropna(subset=["ready_day","EAR"])
+             .loc[events_final["ready_day"] <= TRAIN_END, [ID, "ready_day", "EAR"]]
+             .merge(cal.rename(columns={DATE:"ready_day"}), on=[ID, "ready_day"], how="left", validate="m:1")
+             .rename(columns={"td_rank":"ready_rank"})
+             .dropna(subset=["ready_rank"])
+             .sort_values([ID, "ready_rank"])
+             .reset_index(drop=True))
+
+# ========= 2) Calibration =========
+def estimate_beta_reg(train_df):
+    """beta(d) via régression cross-sectionnelle sans intercept, d=1..D_MAX."""
+    num = np.zeros(D_MAX, dtype=float)
+    den = 0.0
+    for sid, g in train_df.groupby(ID, sort=False):
+        rr = g["ready_rank"].to_numpy()
+        ss = g["EAR"].to_numpy()
+        ranks, csum = csum_dict.get(sid, (None, None))
+        if ranks is None: 
+            continue
+        pos = np.searchsorted(ranks, rr, side="left")
+        for j in range(len(rr)):
+            p0 = pos[j]
+            max_d = min(D_MAX, len(ranks) - p0 - 1)
+            if max_d <= 0: 
+                continue
+            car = csum[p0+1:p0+max_d+1] - csum[p0]   # CAR(d) = somme des abn
+            num[:max_d] += ss[j] * car
+            den         += ss[j] * ss[j]
+    beta = np.divide(num, den, out=np.zeros_like(num), where=den>0)  # beta[d-1] pour d=1..D_MAX
+    if IMPOSE_MONOTONE:
+        beta = np.maximum.accumulate(beta)  # rend beta(d) non décroissant
+    return pd.Series(beta, index=np.arange(1, D_MAX+1), name="beta_d")
+
+def estimate_curves_quintile(train_df, nbins=5):
+    """
+    Méthode 'quintile' :
+      - coupe EAR en nbins (global, sur la période TRAIN)
+      - pour chaque bin et d, calcule mean CAR(d)
+    Renvoie:
+      - car_mean: DataFrame index=d (1..D_MAX), colonnes=bin labels (0..nbins-1)
+      - bin_edges: Series des bords (longueur nbins+1)
+    """
+    # binnings globaux sur EAR (winsor possible ici si besoin)
+    ear = train_df["EAR"].replace([np.inf, -np.inf], np.nan).dropna()
+    q = np.unique(np.quantile(ear, np.linspace(0, 1, nbins+1)))
+    # sécurité si trop peu d'uniques
+    if len(q) <= 2:
+        q = np.array([ear.min(), ear.median(), ear.max()])
+    # affecte chaque event à un bin (labels 0..B-1)
+    def bin_id(x):
+        # np.digitize -> bins à droite fermés
+        return np.clip(np.digitize(x, q[1:-1], right=True), 0, len(q)-2)
+    train_df = train_df.copy()
+    train_df["bin"] = bin_id(train_df["EAR"].values).astype(int)
+
+    # accumulateurs
+    sums = {b: np.zeros(D_MAX, dtype=float) for b in range(len(q)-1)}
+    cnts = {b: np.zeros(D_MAX, dtype=float) for b in range(len(q)-1)}
+
+    for sid, g in train_df.groupby(ID, sort=False):
+        rr  = g["ready_rank"].to_numpy()
+        bb  = g["bin"].to_numpy()
+        ranks, csum = csum_dict.get(sid, (None, None))
+        if ranks is None: 
+            continue
+        pos = np.searchsorted(ranks, rr, side="left")
+        for j in range(len(rr)):
+            p0 = pos[j]
+            max_d = min(D_MAX, len(ranks)-p0-1)
+            if max_d <= 0:
+                continue
+            car = csum[p0+1:p0+max_d+1] - csum[p0]
+            b = int(bb[j])
+            sums[b][:max_d] += car
+            cnts[b][:max_d] += 1
+
+    # moyennes par bin & d
+    car_mean = pd.DataFrame(
+        {b: np.divide(sums[b], cnts[b], out=np.zeros_like(sums[b]), where=cnts[b]>0) 
+         for b in sums},
+        index=np.arange(1, D_MAX+1)
+    )
+    car_mean.index.name = "d"
+    bin_edges = pd.Series(q, name="edges")
+    return car_mean, bin_edges
+
+# lance calibration
+if CALIB_METHOD == "reg":
+    beta_curve = estimate_beta_reg(train_evt)   # Series index d
+    car_q = None; bin_edges = None
+else:
+    car_q, bin_edges = estimate_curves_quintile(train_evt, nbins=NBINS_EAR)
+    beta_curve = None
+
+# ========= 3) Ranks EOM V et prochain EOM W =========
+px_eom = px_eom.sort_values([ID, "month_end"]).copy()
+px_eom["next_month_end"] = px_eom.groupby(ID)["month_end"].shift(-1)
+
+rankV = (px_eom
+         .merge(cal.rename(columns={DATE:"month_end"}), on=[ID, "month_end"], how="left", validate="m:1")
+         .rename(columns={"td_rank":"rank_V"}))
+rankV = (rankV
+         .merge(cal.rename(columns={DATE:"next_month_end", "td_rank":"rank_W"})[[ID, "next_month_end", "rank_W"]],
+                on=[ID, "next_month_end"], how="left"))
+
+# événements avec ready_rank (pour toute la période)
+evt_all = (events_final
+           .dropna(subset=["ready_day","EAR"])
+           .merge(cal.rename(columns={DATE:"ready_day"}), on=[ID,"ready_day"], how="left", validate="m:1")
+           .rename(columns={"td_rank":"ready_rank"})
+           .sort_values([ID,"ready_rank"])
+           .reset_index(drop=True))
+
+# ========= 4) Construction du signal decay-adjusted à EOM =========
+def signal_decay_for_id(gv, ev):
+    """
+    gv: sous-DF rankV pour un id (contient month_end, rank_V, rank_W)
+    ev: événements de cet id (contient ready_rank, EAR)
+    Utilise:
+      - beta_curve (méthode "reg")  OU
+      - car_q & bin_edges (méthode "quintile")
+    """
+    sid = gv[ID].iloc[0]
+    ranks, csum = csum_dict.get(sid, (None, None))
+    out = gv[[ID, "month_end"]].copy()
+    sig = np.full(len(gv), np.nan, dtype=float)
+    if (ranks is None) or ev.empty:
+        out["sig_EAR_decay"] = sig
+        return out
+
+    # dernière annonce avant V
+    rr  = ev["ready_rank"].to_numpy()
+    ear = ev["EAR"].to_numpy()
+    pos_t = np.searchsorted(ranks, rr, side="left")  # index t dans csum
+
+    rv = gv["rank_V"].to_numpy()
+    rw = gv["rank_W"].to_numpy()
+    idx = np.searchsorted(rr, rv, side="right") - 1
+    m = idx >= 0
+    if not m.any():
+        out["sig_EAR_decay"] = sig
+        return out
+
+    i   = idx[m]           # indices d'évènement actif
+    p0  = pos_t[i]         # index t
+    ear_i = ear[i]
+
+    # jours totaux t->W, cap à [1, D_MAX]
+    d_tot = (rw[m] - rr[i]).astype(int)
+    d_tot = np.clip(d_tot, 1, D_MAX)
+
+    # expected total drift t->W
+    if CALIB_METHOD == "reg":
+        exp_tot = beta_curve.reindex(d_tot).to_numpy() * ear_i
+    else:
+        # bin du EAR_i selon edges d'apprentissage
+        # np.digitize renvoie 0..B-1
+        b = np.clip(np.digitize(ear_i, bin_edges.values[1:-1], right=True), 0, len(bin_edges)-2)
+        # valeur moyenne attendue au d_tot de CE bin
+        # car_q index d, colonnes bins
+        exp_tot = car_q.iloc[d_tot - 1, b].to_numpy()
+
+    # realized drift t->V (somme d'anormaux) : csum[pV] - csum[p0]
+    pV = np.searchsorted(ranks, rv[m], side="left")
+    realized = csum[pV] - csum[p0]
+
+    sig[m] = exp_tot - realized
+    out["sig_EAR_decay"] = sig
+    return out
+
+parts = []
+for sid, gv in rankV.groupby(ID, sort=False):
+    ev = evt_all[evt_all[ID]==sid]
+    parts.append(signal_decay_for_id(gv, ev))
+
+sig_decay_monthly = (pd.concat(parts, ignore_index=True)
+                     .sort_values(["month_end", ID])
+                     .reset_index(drop=True))
+# -> colonnes: [ID, month_end, sig_EAR_decay]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # S&P 500 Forecasting Using Macro-Financial Variables
 
 ## Overview
