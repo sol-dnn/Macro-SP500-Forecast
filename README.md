@@ -452,6 +452,143 @@ signals_monthly = (signals
 
 
 
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+
+# --- Alias colonnes ---
+ID, DATE = COL_ID, COL_DATE
+PRICE    = COL_PRICE            # ex: "quoteclose"
+EPS_Q    = "wsf_eps_qtr"        # EPS trimestriel ACTUEL (annoncé au jour J)
+H_LIST   = (30, 60, 90)
+
+# ---------- 0) Préparations ----------
+df = df_daily.sort_values([ID, DATE]).copy()
+if "td_rank" not in df.columns:
+    df["td_rank"] = df.groupby(ID).cumcount()
+
+# calendrier par titre
+cal = df[[ID, DATE, "td_rank"]].drop_duplicates().sort_values([ID, DATE])
+
+# EPS réel @J (si pas déjà dans events_final)
+eps_at_J = df[[ID, DATE, EPS_Q]].rename(columns={DATE:"J"}).drop_duplicates([ID, "J"])
+
+# Base évènements: J & ready_day (on n'altère pas EAR)
+events = events_final[[ID, "J", "ready_day"]].copy()
+if EPS_Q not in events.columns:
+    events = events.merge(eps_at_J, on=[ID, "J"], how="left", validate="m:1")
+
+# ---------- 1) Prix J-1 pour le scaling ----------
+# map rang(J) -> rang(J)-1 -> date -> prix
+events = (events
+          .merge(cal.rename(columns={DATE:"J"}), on=[ID, "J"], how="left", validate="m:1")
+          .assign(Jm1_rank=lambda d: d["td_rank"] - 1)
+          .merge(cal.rename(columns={DATE:"Jm1"})[[ID, "td_rank", "Jm1"]],
+                 left_on=[ID, "Jm1_rank"], right_on=[ID, "td_rank"], how="left")
+          .merge(df.rename(columns={DATE:"Jm1"})[[ID, "Jm1", PRICE]],
+                 on=[ID, "Jm1"], how="left")
+          .rename(columns={PRICE: "price_Jm1"})
+          .drop(columns=["td_rank_x","td_rank_y"], errors="ignore"))
+
+# ---------- 2) prev_eom = dernier EOM STRICTEMENT avant J ----------
+def map_prev_eom_for_events(ev, eom_tab):
+    out=[]
+    for sid, g in ev.groupby(ID, sort=False):
+        eoms = eom_tab[eom_tab[ID]==sid]["month_end"].values
+        if len(eoms)==0: 
+            continue
+        gg = g.sort_values("J").copy()
+        idx = np.searchsorted(eoms, gg["J"].values, side="left") - 1
+        ok  = idx >= 0
+        gg  = gg.loc[ok].copy()
+        gg["prev_eom"] = pd.to_datetime(eoms[idx[ok]])
+        out.append(gg)
+    return pd.concat(out, ignore_index=True) if out else ev.assign(prev_eom=np.nan)
+
+events = map_prev_eom_for_events(events, px_eom[[ID, "month_end"]])
+
+# ---------- 3) Joindre ta prévision ML as-of prev_eom & calculer CFE_ML_Q ----------
+# eps_ml_qtr: [ID, "month_end", "eps_ml_qtr"]  (month_end = dernier jour de bourse)
+events = events.merge(
+    eps_ml_qtr.rename(columns={"month_end":"prev_eom"}),
+    on=[ID, "prev_eom"], how="left", validate="m:1"
+)
+
+# CFE_ML_Q = (EPS_Q @J - EPS_ML(as-of prev_eom)) / Price_{J-1}
+events["CFE_ML_Q"] = (events[EPS_Q] - events["eps_ml_qtr"]) / events["price_Jm1"]
+
+# (option) winsor pour stabilité
+lo, hi = events["CFE_ML_Q"].quantile([0.01, 0.99])
+events["CFE_ML_Q"] = events["CFE_ML_Q"].clip(lo, hi)
+
+# ---------- 4) Porter en mensuel (H=30/60/90) ----------
+# ready_rank pour chaque évènement
+events = (events
+          .merge(cal.rename(columns={DATE:"ready_day"})[[ID, "ready_day", "td_rank"]],
+                 on=[ID, "ready_day"], how="left", validate="m:1")
+          .rename(columns={"td_rank":"ready_rank"}))
+
+# rang du month_end par titre
+rank_V = (px_eom[[ID, "month_end"]]
+          .merge(cal.rename(columns={DATE:"month_end"}), on=[ID, "month_end"], how="left", validate="m:1")
+          .rename(columns={"td_rank":"rank_V"})
+          .sort_values([ID, "month_end"])
+          .reset_index(drop=True))
+
+def carry_signal(rankV_df, evt_df, val_col, H):
+    out=[]
+    for sid, gv in rankV_df.groupby(ID, sort=False):
+        e = evt_df.loc[evt_df[ID]==sid, ["ready_rank", val_col]].dropna(subset=["ready_rank"])
+        if e.empty:
+            tmp = gv[[ID,"month_end"]].copy(); tmp[f"sig_{val_col}_{H}"] = np.nan; out.append(tmp); continue
+        rr = e["ready_rank"].to_numpy()
+        vv = e[val_col].to_numpy()
+        rv = gv["rank_V"].to_numpy()
+        idx = np.searchsorted(rr, rv, side="right") - 1  # dernier event actif avant V
+        m = idx >= 0
+        age = np.where(m, rv - rr[idx], np.inf)
+        sig = np.full(rv.shape, np.nan)
+        sig[m & (age < H)] = vv[idx[m]]
+        tmp = gv[[ID,"month_end"]].copy(); tmp[f"sig_{val_col}_{H}"] = sig
+        out.append(tmp)
+    return pd.concat(out, ignore_index=True)
+
+# Signaux CFE_ML_Q
+evt_cfe = events.dropna(subset=["CFE_ML_Q", "ready_rank"])[[ID, "ready_rank", "CFE_ML_Q"]]
+signals_cfe_ml = rank_V[[ID, "month_end"]].copy()
+for H in H_LIST:
+    signals_cfe_ml = signals_cfe_ml.merge(
+        carry_signal(rank_V, evt_cfe, "CFE_ML_Q", H),
+        on=[ID, "month_end"], how="left"
+    )
+
+# ---------- 5) Merge avec tes signaux EAR mensuels existants ----------
+# Suppose que tu as déjà un DF 'signals_ear_monthly' avec [ID, "month_end", sig_EAR_30/60/90]
+# Sinon, garde juste signals_cfe_ml.
+signals_monthly = signals_cfe_ml.copy()
+if "signals_ear_monthly" in globals():
+    signals_monthly = signals_ear_monthly.merge(
+        signals_cfe_ml, on=[ID, "month_end"], how="left", validate="1:1"
+    )
+
+# -> 'signals_monthly' = grille mensuelle (id, month_end) avec:
+#    - sig_CFE_ML_Q_30 / _60 / _90
+#    - (+ tes sig_EAR_30 / _60 / _90 si fournis)
+
+
+
+
+
+
+
+
+
 import numpy as np
 import pandas as pd
 
