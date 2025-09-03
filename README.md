@@ -497,22 +497,27 @@ events = (events
           .drop(columns=["td_rank_x","td_rank_y"], errors="ignore"))
 
 # ---------- 2) prev_eom = dernier EOM STRICTEMENT avant J ----------
-def map_prev_eom_for_events(ev, eom_tab):
-    out=[]
-    for sid, g in ev.groupby(ID, sort=False):
-        eoms = eom_tab[eom_tab[ID]==sid]["month_end"].values
-        if len(eoms)==0: 
+def map_prev_eom_for_events_asof(ev_df, eom_tab, id_col=COL_ID):
+    out = []
+    for sid, g in ev_df.groupby(id_col, sort=False):
+        left  = g.sort_values("J")
+        right = (eom_tab[eom_tab[id_col]==sid][[id_col, "month_end"]]
+                 .sort_values("month_end")
+                 .rename(columns={"month_end":"prev_eom"}))
+        if right.empty:
             continue
-        gg = g.sort_values("J").copy()
-        idx = np.searchsorted(eoms, gg["J"].values, side="left") - 1
-        ok  = idx >= 0
-        gg  = gg.loc[ok].copy()
-        gg["prev_eom"] = pd.to_datetime(eoms[idx[ok]])
-        out.append(gg)
-    return pd.concat(out, ignore_index=True) if out else ev.assign(prev_eom=np.nan)
+        tmp = pd.merge_asof(
+            left, right,
+            left_on="J", right_on="prev_eom",
+            direction="backward",
+            allow_exact_matches=False
+        )
+        out.append(tmp)
+    return pd.concat(out, ignore_index=True) if out else ev_df.assign(prev_eom=np.nan)
 
-events = map_prev_eom_for_events(events, px_eom[[ID, "month_end"]])
+events = map_prev_eom_for_events_asof(events, px_eom[[COL_ID, "month_end"]])
 
+ 
 # ---------- 3) Joindre ta prévision ML as-of prev_eom & calculer CFE_ML_Q ----------
 # eps_ml_qtr: [ID, "month_end", "eps_ml_qtr"]  (month_end = dernier jour de bourse)
 events = events.merge(
